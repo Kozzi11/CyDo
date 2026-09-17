@@ -5374,7 +5374,7 @@ unittest
 
 version (unittest) private bool isKnownPromptParityAgent(string name)
 {
-	return ["claude", "codex", "copilot"].canFind(name);
+	return ["claude", "codex", "copilot", "vibe"].canFind(name);
 }
 
 version (unittest) private void writePromptParityFixture(string root)

@@ -4,8 +4,8 @@ import cydo.agent.contract : Agent;
 
 struct AgentRegistration
 {
-	string name;         // "claude", "codex", "copilot"
-	string displayName;  // "Claude Code", "Codex", "Copilot"
+	string name;         // "claude", "codex", "copilot", "vibe"
+	string displayName;  // "Claude Code", "Codex", "Copilot", "Mistral Vibe"
 	Agent function() create;
 }
 
@@ -19,6 +19,9 @@ immutable agentRegistry = [
 	),
 	AgentRegistration("copilot", "Copilot",
 		function Agent() { import cydo.agent.drivers.copilot : CopilotAgent; return new CopilotAgent(); },
+	),
+	AgentRegistration("vibe", "Mistral Vibe",
+		function Agent() { import cydo.agent.drivers.vibe : VibeAgent; return new VibeAgent(); },
 	),
 ];
 

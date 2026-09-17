@@ -25,7 +25,7 @@ struct SandboxConfig
 	@Optional GitIdentityConfig git;
 }
 
-enum AgentDriver { claude, codex, copilot }
+enum AgentDriver { claude, codex, copilot, vibe }
 
 /// Whether a driver has any mechanism for the `effort` launch parameter.
 /// The *values* are not validated — they pass through to the CLI, which owns
@@ -37,6 +37,7 @@ bool driverSupportsEffort(AgentDriver driver)
 		case AgentDriver.claude:  return true;   // `--effort <value>`
 		case AgentDriver.codex:   return true;   // `model_reasoning_effort` config key
 		case AgentDriver.copilot: return false;  // no reasoning-effort knob
+		case AgentDriver.vibe:    return false;  // `thinking` config option, not a launch flag
 	}
 }
 

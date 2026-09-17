@@ -1481,6 +1481,9 @@ private:
 				case AgentDriver.copilot:
 					installHint = "the appropriate package for your agent";
 					break;
+				case AgentDriver.vibe:
+					installHint = "`uv tool install mistral-vibe` (or brew / GitHub release)";
+					break;
 				}
 			}
 			return "The **`" ~ td.agentName ~ "`** CLI was not found on `PATH`.\n\n"

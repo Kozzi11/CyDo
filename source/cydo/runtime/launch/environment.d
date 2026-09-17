@@ -155,6 +155,7 @@ unittest
 		NativeHistoryRule(AgentDriver.claude, "CLAUDE_CONFIG_DIR", ".claude", null),
 		NativeHistoryRule(AgentDriver.codex, "CODEX_HOME", ".codex", null),
 		NativeHistoryRule(AgentDriver.copilot, "COPILOT_HOME", ".copilot", null),
+		NativeHistoryRule(AgentDriver.vibe, "VIBE_HOME", ".vibe", null),
 	];
 	foreach (testRule; rules)
 	{
