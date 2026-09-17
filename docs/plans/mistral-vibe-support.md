@@ -192,7 +192,7 @@ out naturally, as they do for Codex/Copilot.
 | Interrupt | ✓ | ✓ | ✓ | ✓ (`session/cancel`) |
 | Images | ✓ | ✗ | ✗ | ✗ initially |
 | Effort knob | ✓ | ✓ | ✗ | ✗ initially (`thinking` later) |
-| CyDo MCP tools | ✓ | ✓ | ✓ | ✓ (VIBE_HOME config.toml) |
+| CyDo MCP tools | ✓ | ✓ | ✓ | ✓ (`session/new mcpServers`, spike-verified) |
 | Native file revert | ✓ | ✗ | ✗ | ✗ |
 | Session resume (cross-restart) | ✓ | ✓ | ✓ | **open** (needs `session/load` verification) |
 | Session fork | ✓ | ✓ | ✗ | ✗ |
@@ -200,61 +200,72 @@ out naturally, as they do for Codex/Copilot.
 
 ---
 
-## Open questions — run a verification spike first
+## Spike results (2026-09-17, vibe 2.25.4) — all questions resolved
 
-Before implementation, run `vibe-acp` under a wire logger
-(`mitm`-style stdio capture is enough; e.g. a shim script that tees stdin/stdout
-— `tests/extra-fields-wrapper.sh` is a precedent for wrapper shims):
+The spike ran against live `vibe-acp` (SDK client + vibe's built-in wire
+logger). Full findings: `docs/research/vibe-acp-wire.md`. Summary:
 
-1. **ACP dialect distance.** Vibe pins `agent-client-protocol == 0.11.0`,
-   while `docs/research/acp/SPEC.md` documents schema 0.11.3 (Copilot).
-   The Python SDK 0.11.0 maps to ACP schema ~0.12.x-era wire shapes
-   (`session/resume`, `session/close`, `logout`, usage_update), not the
-   0.7.x-era dialect the earlier draft assumed.
-   Capture the actual `initialize` result: `protocolVersion`,
-   `agentCapabilities.loadSession`, `mcpCapabilities`,
-   `sessionCapabilities` (list/fork), and the exact `session/update` variant
-   names. Method/param renames between the previously assumed 0.7.x and the actual 0.11.0 pin directly shape the
-   driver's RPC structs.
-2. **Resume semantics.** Can a fresh `vibe-acp` process `session/load` a
-   session created by a previous process (external `sessionId`), and does the
-   replay surface as `user_message_chunk`/`agent_message_chunk`? This decides
-   whether cross-restart resume lands in v1 or is deferred
-   (`resumeSessionId` ignored with a clear error).
-3. **MCP delivery.** Does `session/new`'s `mcpServers` param work in
-   vibe-acp (Copilot's is infamously broken — SPEC #1040), or must MCP go
-   through `config.toml`? The `VIBE_HOME` config path is the safe default
-   either way.
-4. **Session storage format.** What does vibe actually persist under
-   `$VIBE_HOME` (logs/session dirs), is it stable JSONL of `LLMMessage`s, and
-   can `translateHistoryLine`/`enumerateAllSessions` be implemented against
-   it? If not, offline history replay is deferred and live-CLI resume is the
-   only replay path.
-5. **Prompt steering in ACP mode.** Whether `AGENTS.md`/system-prompt
-   configuration applies to `vibe-acp` sessions (DeepWiki suggests the same
-   orchestrator backs both; confirm), which decides
-   `supportsDeveloperPrompt`.
-6. **Headless behavior.** Trust-folder prompts, update prompts, and any TTY
-   assumptions under bwrap with `--clearenv`; confirm the pre-seeded
-   `trusted_folders.toml` + `enable_update_checks = false` recipe suffices.
-7. **Model ids.** Pin current Devstral 2 / Mistral Medium ids for the
-   `small`/`medium`/`large` defaults.
+1. **ACP dialect.** Protocol version 1, standard current-v1 shapes — matches
+   `docs/research/acp/SPEC_v1.md` exactly. `loadSession: true` (top-level),
+   `sessionCapabilities` = list/fork/close, image+embeddedContext prompts.
+   RPC structs can be written directly from SPEC_v1.
+2. **Resume semantics.** Cross-process `session/load` **works**: replay arrives
+   as `user_message_chunk`/`agent_thought_chunk`/`agent_message_chunk`/tool
+   pairs, ends with a synthetic `checkpoint:resume:*` completed tool call, and
+   continuation prompts prove full context survival. Resume lands in v1.
+3. **MCP delivery.** `session/new` `mcpServers` **works** (verified with a live
+   stdio FastMCP server; tool surfaced as `spike_spike_ping` and executed).
+   No `config.toml` MCP bootstrap needed. Note vibe advertises
+   `mcpCapabilities` all-false yet loads stdio servers — do not gate on it.
+4. **Session storage.** `$VIBE_HOME/logs/session/session_<ts>_<id8>/` with
+   `meta.json` (session_id, cwd, title, stats, config) + `messages.jsonl`
+   (one LLM message per line: role/content/reasoning/tool_calls).
+   `translateHistoryLine`/`enumerateAllSessions` are implementable.
+5. **Prompt steering.** AGENTS.md files apply in ACP sessions (confirmed via
+   the assembled system prompt in session meta). No raw developer-prompt wire
+   field exists, so CyDo keeps the prepend-to-user-input path;
+   `supportsDeveloperPrompt` stays false.
+6. **Headless behavior.** No trust or update prompts fired; trust state is
+   reported via `session/new` `field_meta.workspace_trust` but is not
+   blocking. Pre-seeding `trusted_folders.toml` stays recommended-only.
+   Sandbox needs python3 visible (or use the static release tarball).
+7. **Model ids.** Default catalog: `mistral-medium-3.5` (default),
+   `devstral-small`, `local` (llamacpp). Thinking knob: `off/low/medium/
+   high/max`. Read options from `session/new configOptions` rather than
+   hardcoding.
 
-The spike is ~half a day: install Vibe, capture one interactive session's
-wire traffic, inspect `$VIBE_HOME`, and answer items 1–4.
+New findings that shape the driver: permission `toolCall` carries only
+`toolCallId` (correlate with prior notifications); tool display name lives in
+`_meta.tool_name` (`{server}_{tool}` for MCP, `effect_kind` distinguishes
+shell/tool); compaction = tool pair with `_meta.checkpoint_kind: "compaction"`
+(don't match titles); turn usage is on the `session/prompt` response; prompt
+response also returns `field_meta.show_feedback_prompt` occasionally (ignore);
+sessions are in-process — no orphaned children to reap at shutdown.
 
----
+| Capability | claude | codex | copilot | vibe (spike-confirmed) |
+|---|---|---|---|---|
+| Streaming sessions | ✓ | ✓ | ✓ | ✓ |
+| Live steering (queue) | ✓ | ✓ (`turn/steer`) | ✓ (queue) | queue → next `session/prompt` |
+| Interrupt | ✓ | ✓ | ✓ | ✓ (`session/cancel` → `stopReason: cancelled`, verified) |
+| Images | ✓ | ✗ | ✗ | **✓ possible** (`promptCapabilities.image=true`) — deferred |
+| Effort knob | ✓ | ✓ | ✗ | **✓ possible** (`thinking` config option) — later |
+| CyDo MCP tools | ✓ | ✓ | ✓ | ✓ (`session/new mcpServers`, verified) |
+| Native file revert | ✓ | ✗ | ✗ | ✗ |
+| Session resume (cross-restart) | ✓ | ✓ | ✓ | **✓ (`session/load`, verified)** |
+| Session fork | ✓ | ✓ | ✗ | **✓ advertised** (`sessionCapabilities.fork`) — untested |
+| Offline history replay | ✓ | ✓ | ✓ | **✓ feasible** (JSONL + meta.json) |
 
 ## Suggested phasing
 
-1. **Spike** (above) → fill in the capability matrix and RPC struct shapes.
+1. ~~**Spike**~~ — **done 2026-09-17**; findings in
+   `docs/research/vibe-acp-wire.md`, matrix above filled in.
 2. **Driver core**: enum + registry + `vibe.d` with new-session/prompt/stream/
    cancel, sandbox config, one-shot via `--prompt` for titles. Unit tests
    against a scripted stdio connection (the `TestCopilotConnection` pattern).
 3. **MCP tool delivery** + e2e: Nix packaging, mock-backend wiring, a
    `vibe` Playwright project, one basic-flow spec. Gate: `nix flake check`.
-4. **History & resume** per spike findings (storage parsing and/or
-   `session/load`).
+4. **History & resume**: both confirmed feasible by the spike — `session/load`
+   resume and `messages.jsonl`/`meta.json` storage parsing.
 5. **Polish**: thinking/effort mapping via config options, Vibe-native tool
    renderers if any, doc updates (README agent table).
 

@@ -10,25 +10,53 @@ E2E matrix. No work is complete until it passes.
 
 ---
 
-## Part 0: Spike (do first, ~½ day)
+## Part 0: Spike — DONE (2026-09-17)
 
-The plan assumes a wire dialect that must be confirmed before the driver RPC
-structs are finalized. Capture one real `vibe-acp` session through a
-tee/wrapper shim (precedent: `tests/extra-fields-wrapper.sh`) and answer:
+The spike ran against live `vibe-acp` v2.25.4 (SDK-driven capture + vibe's
+built-in `VIBE_ACP_LOGGING_ENABLED` wire logger). Full findings and raw
+message shapes: **`docs/research/vibe-acp-wire.md`**. Answers:
 
-| # | Question | Decides |
-|---|----------|---------|
-| S1 | `initialize` result: `protocolVersion`, `agentCapabilities` (`loadSession`, `mcpCapabilities`, `sessionCapabilities`), `agentInfo` | RPC struct fields, resume capability flag |
-| S2 | Exact `session/update` variant names for the pinned `agent-client-protocol==0.11.0` (vs. schema 0.11.3-era v1 spec in `docs/research/acp/SPEC_v1.md`) | `VibeAcpRouter` dispatch table |
-| S3 | Does `session/new` `mcpServers` actually load tools? | Whether the `config.toml` fallback in Step 3 is required |
-| S4 | Does a fresh `vibe-acp` process `session/load` a session from a previous process? Replay update shape? | Whether Step 8 (resume) lands in v1 |
-| S5 | On-disk session format under `$VIBE_HOME` (layout, per-line schema) | Step 9 (history) feasibility |
-| S6 | Do `AGENTS.md` / config system prompts apply to ACP sessions? | `supportsDeveloperPrompt` value |
-| S7 | Headless behavior in bwrap `--clearenv`: trust-folder prompt, update prompt, TTY assumptions | Pre-seed recipe in Step 3 |
-| S8 | Current Devstral 2 / Mistral Medium model ids | Model defaults in Step 2 |
+| # | Answer | Plan consequence |
+|---|--------|------------------|
+| S1 | v1 protocol, standard shapes; `loadSession=true`, sessionCaps list/fork/close | RPC structs straight from `docs/research/acp/SPEC_v1.md` |
+| S2 | Stable v1 variants only (`agent_message_chunk`, `tool_call`, `tool_call_update`, `plan`, `session_info_update`, `usage_update`, `available_commands_update`); tool name in `_meta.tool_name`; MCP = `{server}_{tool}` | Dispatch table final (see below); cydo MCP matching = `cydo_` prefix |
+| S3 | `session/new mcpServers` **works** | Drop the config.toml MCP bootstrap; keep config.toml for backend override + telemetry/update suppression |
+| S4 | Cross-process `session/load` **works**; replay = chunk updates + `checkpoint:resume:*` synthetic tool call | Step 8 (resume) in v1 |
+| S5 | `$VIBE_HOME/logs/session/session_<ts>_<id8>/{meta.json,messages.jsonl}`; JSONL of LLM messages | Step 9 (history) feasible |
+| S6 | AGENTS.md applies in ACP sessions; no raw developer-prompt field | `supportsDeveloperPrompt = false`; prepend-to-user-input path |
+| S7 | No trust/update prompts; trust reported in `session/new field_meta.workspace_trust` (non-blocking) | Pre-seed trust optional; static tarball or visible python3 under bwrap |
+| S8 | Models: `mistral-medium-3.5` (default), `devstral-small`, `local`; thinking `off..max` | Model defaults pinned; read catalog from `session/new` when possible |
 
-Record findings in `docs/research/vibe-acp-wire.md` (new file, same style as
-`docs/research/acp/SPEC.md`).
+Driver-shaping facts from the wire capture:
+
+- Permission `session/request_permission` arrives with `toolCall` containing
+  **only** `toolCallId` — correlate for display with the preceding
+  `tool_call`/`tool_call_update`. Options are the four vibe ids
+  (`allow_once`, `allow_always`, `allow_always_permanent`, `reject_once`);
+  permanent reuses standard `kind: allow_always`. Auto-approve with
+  `allow_once`.
+- Allowlisted bash commands never prompt (default config allowlists `echo`,
+  `cat`, `ls`, …); `ask_user_question`/`exit_plan_mode` are disabled in ACP
+  sessions by default — no elicitations expected.
+- `agent_message_chunk`/`agent_thought_chunk` carry `messageId` (UUID) — use
+  as the streaming-item key.
+- Tool display name: `_meta.tool_name` (not the title); `_meta.effect_kind`
+  distinguishes `shell`/`tool`.
+- Compaction: tool pair with `_meta.checkpoint_kind: "compaction"`, kind
+  `think` — match on that, never on titles. Resume marker:
+  `toolCallId` starting `checkpoint:resume:`.
+- Turn usage: standard `usage` object on the `session/prompt` response.
+  `usage_update` `_meta` is vibe-specific (tokens/sec etc.) — ignore.
+- Modes + config options returned by `session/new`: modes
+  `ask`(default)/`plan`/`accept-edits`/`auto-approve`/`lean`; options
+  `mode`/`model`/`thinking`. `session/set_mode` + `session/set_config_option`
+  both available.
+- Sessions run **in-process** (no persistent child process); the only
+  subprocess is a short-lived PTY helper per shell command. Simple shutdown
+  (`closeStdin` + `terminate`, kill-after-timeout backstop) should suffice;
+  the SdkProcess orphan-drain dance likely unneeded (verify under bwrap).
+- Auth: `MISTRAL_API_KEY` works with no `authenticate` call despite non-empty
+  `authMethods` (`browser-auth`).
 
 ---
 
@@ -179,35 +207,27 @@ in `copilot.d`) — the semantics are identical.
    ```toml
    # managed by CyDo — per-task agent profile
    enable_update_checks = false
+   enable_telemetry = false
    active_model = "<resolved model>"        # only when config.model set
-
-   [[mcp_servers]]
-   name = "cydo"
-   transport = "stdio"
-   command = "<cydoBinaryPath()>"
-   args = ["mcp-server"]
-
-   [mcp_servers.env]
-   CYDO_TID = "<tid>"
-   CYDO_SOCKET = "<config.mcpSocketPath>"
-   CYDO_CREATABLE_TYPES = "<config.creatableTaskTypes>"
-   CYDO_SWITCHMODES = "<config.switchModes>"
-   CYDO_HANDOFFS = "<config.handoffs>"
-   CYDO_INCLUDE_TOOLS = "<join(includeTools, \",\")>"
    ```
-   (Env contract mirrors `generateCopilotMcpConfig`; S3 decides whether
-   `session/new mcpServers` can replace this file entirely — prefer the
-   file, it is version-stable.)
-   Store the path in `lastMcpConfigPath_` — actually store the *profile
-   config path*; the existing cleanup-on-exit contract in `app.d` deletes
-   the tracked file, so track the generated file only when it was created
-   fresh (or track `null` when pre-existing — delete nothing).
+   S3 resolved: **MCP does NOT go through config.toml** — `session/new
+   mcpServers` works (verified against 2.25.4). The CyDo MCP server is
+   delivered in the handshake instead (Step 2.6):
+   ```d
+   auto cydoMcp = McpServerStdio("cydo", cydoBinaryPath(),
+       ["mcp-server"], [EnvVariable("CYDO_TID", ...), ...]);
+   ```
+   Env contract mirrors `generateCopilotMcpConfig` (`CYDO_TID`,
+   `CYDO_SOCKET`, `CYDO_CREATABLE_TYPES`, `CYDO_SWITCHMODES`,
+   `CYDO_HANDOFFS`, `CYDO_INCLUDE_TOOLS`) but passed as MCP server `env`
+   entries in `session/new`.
 3. **Pre-seed `trusted_folders.toml`** (`$VIBE_HOME/trusted_folders.toml`):
-   add the session work dir (worktree path or project path) so vibe never
-   blocks on its trust prompt under bwrap (S7 verifies).
+   optional — S7 confirmed trust is non-blocking (reported via
+   `session/new field_meta.workspace_trust`). Keep the pre-seed for
+   determinism; `trusted = ["<work dir>"]`.
 4. **Spawn args.**
    ```d
-   string[] vibeArgs = [vibeBin, "--stdio"];   // S2 confirms invocation shape
+   string[] vibeArgs = [vibeBin];   // S2-verified: no flags; vibe-acp is stdio-only
    auto args = launch.cmdPrefix !is null
        ? launch.cmdPrefix ~ vibeArgs : vibeArgs;
    auto server = new VibeAcpProcess(args);
@@ -241,10 +261,10 @@ Model on `AppServerProcess` (codex) + `SdkProcess` (copilot):
       // Agent → client permission request (respond auto-allow)
       @RPCName("session/request_permission") Promise!PermissionOutcome
           requestPermission(PermissionRequestParams);
-      // Agent → client fs/terminal requests: respond with JSON-RPC errors
-      // (method-not-found is safer than a wrong-shape result) unless S1
-      // shows vibe requires them.
-      // @RPCName("fs/read_text_file")  … (declare per S1 capabilities)
+      // S1-verified: vibe declares no fs/terminal usage requirements and the
+      // capture saw no fs/terminal requests. If one ever arrives, respond
+      // method-not-found (safer than a wrong-shape result).
+      // @RPCName("fs/read_text_file")  … (declare only if ever needed)
   }
   ```
 - Shutdown: copy `SdkProcess.shutdown` verbatim including the
@@ -270,8 +290,10 @@ server.onReady(() {
 });
 ```
 
-`session/new` params per S2 (0.11.x pins `{cwd, mcpServers}`):
+`session/new` params per S2 (wire-confirmed `{cwd, mcpServers}`; also
+accepts `additionalDirectories` — vibe supports it per its Agent interface):
 - `cwd` = task work dir
+- `mcpServers` = [cydo MCP stdio server (Step 2.4) — S3-verified delivery]
 - On success → `session.onSessionStarted(model, workDir)` (mirrors
   `CopilotSession.onSessionStarted`): emit synthetic `session/init` with
   `agent = "vibe"`, `supports_file_revert = false`, `agent_name`,
@@ -303,7 +325,7 @@ Copy the `CopilotSession` skeleton and replace the event source:
   | `tool_call` | finalize active text; `item/started{tool_use}` with decomposed name/input; emit single `input_json_delta` when input non-empty |
   | `tool_call_update` (completed) | `item/completed` + `item/result` (content text; `rawOutput.content`/`detailedContent` fallback like `extractResultText` in copilot.d) |
   | `tool_call_update` with `diff` content | `item/result` with the diff block preserved (`[{type:"diff",...}]` content fragment) |
-  | compaction synthetic tool_call start/end | **consume**; emit one `session/compacted` at end (title match "Compacting conversation history", S2) |
+  | compaction synthetic tool_call start/end | **consume**; emit one `session/compacted` at end (detect via `_meta.checkpoint_kind == "compaction"` — never title matching; also consume `toolCallId` starting `checkpoint:resume:`) |
   | `user_message_chunk` | `item/started{user_message}` (load replay only) |
   | `plan` | ignore v1 |
   | `available_commands_update`, `current_mode_update` | ignore |
@@ -419,10 +441,13 @@ Add to `devShells`/test `nativeBuildInputs` next to `copilot-cli`
   VIBECFG
   ln -sf ${vibe-acp}/bin/vibe-acp /tmp/fake-bin/vibe-acp
   ```
-  (Exact `[generic]` table shape per S8/config reference; the mock speaks
-  OpenAI-compatible already for codex. If vibe's generic dialect needs a
-  tweak, extend `tests/mock-api/server.mjs` — **no proxy needed**, unlike
-  copilot.)
+  (S8: the mock override uses a `providers` entry — `name`, `api_base`,
+  `api_key_env_var`, `api_style = "openai"`, `backend = "generic"` — plus a
+  matching models entry; mirror the `llamacpp` provider shape from a real
+  config. The mock speaks OpenAI-compatible already for codex. No
+  `mcp_servers` entry needed — MCP is delivered via `session/new`. If vibe's
+  generic dialect needs a tweak, extend `tests/mock-api/server.mjs` —
+  **no proxy needed**, unlike copilot.)
 - Pre-seed trust for `/tmp/cydo-test-workspace` in the same block.
 
 ### Commit 3.3 — e2e config + first spec
@@ -449,25 +474,26 @@ Add to `devShells`/test `nativeBuildInputs` next to `copilot-cli`
 
 ## Part 4: History, resume, polish (post-spike scope)
 
-4. **Resume** (`session/load`): if S4 confirms cross-process resume,
-   implement `sendSessionLoad` + replay handling
-   (`user_message_chunk` → `item/started{user_message, is_replay:true}`).
-   Otherwise `resumeSessionId` is accepted and ignored with a clear stderr
-   diagnostic, and `historyPath`/`enumerateAllSessions` return
-   null/empty (`supportsFileRevert` already false).
-5. **History** (`translateHistoryLine` / storage parsing): only if S5 shows
-   a stable parseable format. Until then `translateHistoryLine` returns
-   `[]` (empty = skip line) and discovery APIs return empty arrays — the
-   UI still shows history from CyDo's own event log; only native resume is
-   lost.
+4. **Resume** (`session/load`): S4 confirmed cross-process resume works.
+   Implement `sendSessionLoad` + replay handling: chunks → history items;
+   `user_message_chunk` → `item/started{user_message, is_replay:true}`;
+   consume the terminal `checkpoint:resume:*` completed tool call.
+5. **History** (`translateHistoryLine` / storage parsing): S5 confirmed the
+   format — `$VIBE_HOME/logs/session/session_<ts>_<id8>/` with `meta.json`
+   (`session_id`, `origin_directory` for project matching, `title`, `stats`)
+   and `messages.jsonl` (one LLM message per line:
+   role/content/reasoning_content/tool_calls). Implement
+   `enumerateAllSessions` (scan dirs, read meta) and `translateHistoryLine`
+   (map LLM-message lines to agnostic items).
 6. **Thinking/effort**: map `config.effort` → vibe's `thinking` config
-   option via `session/set_config_option` (0.11.x has it stable) or
-   config.toml at session start; flip `driverSupportsEffort` to `true` and
-   update the config tests.
-7. **Prompt path**: settle `supportsDeveloperPrompt` from S6; if false,
-   CyDo's prepend-to-user-input fallback applies automatically (no code).
-8. **Docs**: README agent table row; `docs/plans/mistral-vibe-support.md`
-   capability matrix update; AGENTS.md untouched.
+   option (`off`/`low`/`medium`/`high`/`max`) via
+   `session/set_config_option` (stable) at session start; flip
+   `driverSupportsEffort` to `true` and update the config tests.
+7. **Prompt path**: S6 settled — `supportsDeveloperPrompt = false` (AGENTS.md
+   applies natively; no raw developer-prompt wire field). CyDo's
+   prepend-to-user-input fallback applies automatically (no code).
+8. **Docs**: README agent table row; capability matrix already updated in
+   `docs/plans/mistral-vibe-support.md`; AGENTS.md untouched.
 
 ---
 
@@ -485,18 +511,24 @@ Add to `devShells`/test `nativeBuildInputs` next to `copilot-cli`
 | `tests/e2e/agent-sandbox-env.yaml` | vibe agent entry |
 | `tests/e2e/vibe-basic-flow.spec.ts` | **new** — 3 starter specs |
 | `tests/mock-api/server.mjs` | only if vibe's generic dialect needs handler tweaks |
-| `docs/research/vibe-acp-wire.md` | **new** — spike findings |
+| `docs/research/vibe-acp-wire.md` | **done** — spike findings (2026-09-17) |
 | `docs/plans/mistral-vibe-support.md` | capability matrix updates post-spike |
 
 ## Risk register (implementation view)
 
-- **Dialect drift** (S2): all RPC structs in one file section, one comment
-  naming the pinned vibe version; treat like Copilot's versioned SDK.
-- **Shutdown hangs**: copy the SdkProcess `shutdown()` dance (daemon timers,
-  forced pipe close) wholesale — it exists for exactly this process class.
+- **Version pinning** (was dialect drift, now verified for 2.25.4): all RPC
+  structs in one file section, one comment naming the verified vibe version
+  (2.25.4, ACP SDK 0.11.0/0.12.1); treat like Copilot's versioned SDK.
+- **Shutdown hangs** (downgraded): S-spike showed sessions are in-process;
+  the only child is a short-lived PTY helper. Start with simple
+  `closeStdin + terminate` + kill-after-timeout; escalate to the SdkProcess
+  orphan-drain dance only if bwrap testing shows hangs.
 - **MCP env contract**: `CYDO_SOCKET`/`CYDO_TID` must reach the MCP server
-  process vibe spawns; verify inside bwrap that vibe passes the env block
-  through (S3/S7).
-- **Trust prompt under bwrap**: pre-seeded `trusted_folders.toml` may use an
-  absolute-path format that shifts under sandbox path rewriting — verify in
-  the spike with the rendered sandbox path.
+  process vibe spawns — delivery is now wire-verified (S3), but verify the
+  env entries pass through inside bwrap.
+- **Trust prompt under bwrap** (downgraded): trust is non-blocking
+  (S7-verified); pre-seeding is determinism only. Note trust paths are
+  normalized absolute paths — pre-seed with the rendered sandbox path.
+- **Model catalog drift**: the default model set is GrowthBook-tunable
+  (`vibe_cli_default_routing_model`); read `configOptions` from
+  `session/new` instead of hardcoding ids where feasible.
