@@ -544,6 +544,12 @@ class VibeAgent : Agent
 			paths.requireReadVisible(path,
 				SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "vibe",
 					"Vibe executable"));
+		// One-shot completion runs the separate `vibe` CLI binary; when it is
+		// resolvable it must be visible in the sandbox too.
+		foreach (path; executableMountPaths(resolveExecutablePath(oneShotExecutableName(env), env)))
+			paths.requireReadVisible(path,
+				SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "vibe",
+					"Vibe one-shot CLI"));
 		paths.requireReadVisible(cydoBinaryDir(),
 			SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "vibe",
 				"CyDo binary"));
@@ -579,6 +585,13 @@ class VibeAgent : Agent
 	string executableName(string[string] env)
 	{
 		return effectiveEnvValue(env, "CYDO_VIBE_BIN", "vibe-acp");
+	}
+
+	/// The one-shot path runs the `vibe` CLI rather than `vibe-acp`: both read
+	/// the same config, but only the CLI exposes the programmatic --prompt mode.
+	string oneShotExecutableName(string[string] env)
+	{
+		return effectiveEnvValue(env, "CYDO_VIBE_CLI_BIN", "vibe");
 	}
 
 	AgentSession createSession(int tid, string resumeSessionId, ProcessLaunch launch,
@@ -866,9 +879,10 @@ class VibeAgent : Agent
 		import std.string : strip;
 
 		auto promise = new Promise!string;
-		auto vibeBin = launch.executablePath.length > 0
-			? launch.executablePath
-			: executableName(launch.sandbox.env);
+		// One-shot runs the `vibe` CLI's programmatic mode; vibe-acp has no
+		// --prompt mode, so the session's executablePath (vibe-acp) is not
+		// consulted here.
+		auto vibeBin = oneShotExecutableName(launch.sandbox.env);
 
 		string[string] env = [
 			"PATH": environment.get("PATH", ""),
@@ -876,9 +890,24 @@ class VibeAgent : Agent
 		];
 
 		auto spec = resolveModelSpec(modelClass);
-		auto args = buildVibeOneShotArgs(vibeBin, prompt, spec.model, launch);
+		// The CLI has no --model flag; VIBE_ACTIVE_MODEL overrides any config
+		// field (verified against vibe 2.25.4). An empty alias leaves it unset
+		// so vibe uses its own configured default.
+		if (spec.model.length > 0)
+			env["VIBE_ACTIVE_MODEL"] = spec.model;
+		auto args = buildVibeOneShotArgs(vibeBin, prompt, launch);
 
-		auto procEnv = launch.cmdPrefix is null ? env : null;
+		// Unsanboxed: pass the minimal env above. Sanboxed: the child inherits
+		// the parent environment (cmdPrefix carries the sandbox settings), so
+		// the override needs a full copy of it to survive there.
+		string[string] procEnv;
+		if (launch.cmdPrefix is null)
+			procEnv = env;
+		else if (spec.model.length > 0)
+		{
+			procEnv = environment.toAA();
+			procEnv["VIBE_ACTIVE_MODEL"] = spec.model;
+		}
 
 		AgentProcess proc;
 		try
@@ -921,7 +950,7 @@ class VibeAgent : Agent
 }
 
 private static string[] buildVibeOneShotArgs(string vibeBin, string prompt,
-	string model, ProcessLaunch launch)
+	ProcessLaunch launch)
 {
 	string[] args = [
 		vibeBin,
@@ -930,10 +959,6 @@ private static string[] buildVibeOneShotArgs(string vibeBin, string prompt,
 		"--max-turns", "1",
 		"--yolo",
 	];
-	// An empty alias means no explicit model; omit the flag so vibe uses its
-	// own configured default.
-	if (model.length > 0)
-		args ~= ["--model", model];
 	if (launch.cmdPrefix !is null)
 		args = launch.cmdPrefix ~ args;
 	return args;
@@ -2196,22 +2221,27 @@ unittest
 
 unittest
 {
-	ProcessLaunch launch;
-	auto args = buildVibeOneShotArgs("vibe-acp", "hello", "mistral-medium-3.5",
-		launch);
+	import std.algorithm : canFind;
+
+	auto agent = new VibeAgent;
+	assert(agent.executableName(["CYDO_VIBE_BIN": "/opt/vibe-acp"])
+		== "/opt/vibe-acp");
+	assert(agent.oneShotExecutableName(["CYDO_VIBE_CLI_BIN": "/opt/vibe"])
+		== "/opt/vibe");
+
+	ProcessLaunch launch; // .init: no cmdPrefix
+	auto args = buildVibeOneShotArgs("vibe", "hello", launch);
 	assert(args == [
-		"vibe-acp", "--prompt", "hello", "--output", "text",
-		"--max-turns", "1", "--yolo", "--model", "mistral-medium-3.5",
-	]);
-	auto noModel = buildVibeOneShotArgs("vibe-acp", "hello", "", launch);
-	assert(noModel == [
-		"vibe-acp", "--prompt", "hello", "--output", "text",
+		"vibe", "--prompt", "hello", "--output", "text",
 		"--max-turns", "1", "--yolo",
 	]);
+	// vibe has no --model flag; the model travels via the VIBE_ACTIVE_MODEL
+	// env override set in completeOneShot.
+	assert(!args.canFind("--model"));
 	launch.cmdPrefix = ["bwrap"];
-	auto prefixed = buildVibeOneShotArgs("vibe-acp", "hello", "", launch);
+	auto prefixed = buildVibeOneShotArgs("vibe", "hello", launch);
 	assert(prefixed == [
-		"bwrap", "vibe-acp", "--prompt", "hello", "--output", "text",
+		"bwrap", "vibe", "--prompt", "hello", "--output", "text",
 		"--max-turns", "1", "--yolo",
 	]);
 }

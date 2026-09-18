@@ -189,6 +189,60 @@ EOF
             meta.platforms = [ "x86_64-linux" "aarch64-linux" ];
           };
 
+          # Mistral Vibe — pre-built PyInstaller onedir bundles from GitHub
+          # releases. Two binaries ship from the same release: `vibe-acp`
+          # (the ACP server used for sessions) and `vibe` (the one-shot CLI);
+          # both read the same config.
+          vibeVersion = "2.25.4";
+          vibeAcpSrc = {
+            x86_64-linux = {
+              url = "https://github.com/mistralai/mistral-vibe/releases/download/v${vibeVersion}/vibe-acp-linux-x86_64-${vibeVersion}.tar.gz";
+              hash = "sha256-nX5aAZTBogMK+OtJQdGulPAK4x0kGxWfNEtbOFtWQP0=";
+            };
+            aarch64-linux = {
+              url = "https://github.com/mistralai/mistral-vibe/releases/download/v${vibeVersion}/vibe-acp-linux-aarch64-${vibeVersion}.tar.gz";
+              hash = "sha256-ZjfO+4J8/2MnEEE/B4Ij1DzlGNPiNHONAyOPv+A104g=";
+            };
+          }.${system} or (throw "Mistral Vibe: unsupported system ${system}");
+          vibeCliSrc = {
+            x86_64-linux = {
+              url = "https://github.com/mistralai/mistral-vibe/releases/download/v${vibeVersion}/vibe-linux-x86_64-${vibeVersion}.zip";
+              hash = "sha256-5as05ULwM1J6IYt0YhFLLa4QDqXuCoePLgFcReHy84s=";
+            };
+            aarch64-linux = {
+              url = "https://github.com/mistralai/mistral-vibe/releases/download/v${vibeVersion}/vibe-linux-aarch64-${vibeVersion}.zip";
+              hash = "sha256-vypCQI/2iMWVT5Apl3eLVH2XUXSh8ziWrIG6Z63y4Yo=";
+            };
+          }.${system} or (throw "Mistral Vibe: unsupported system ${system}");
+
+          mistral-vibe = pkgs.stdenv.mkDerivation {
+            pname = "mistral-vibe";
+            version = vibeVersion;
+            src = pkgs.fetchurl { inherit (vibeAcpSrc) url hash; };
+            cliZip = pkgs.fetchurl { inherit (vibeCliSrc) url hash; };
+            nativeBuildInputs = [ pkgs.autoPatchelfHook pkgs.unzip ];
+            buildInputs = [ pkgs.zlib pkgs.libgcc.lib pkgs.stdenv.cc.cc.lib ];
+            # PyInstaller binaries are pre-stripped; patching may corrupt them.
+            dontStrip = true;
+            unpackPhase = ''
+              runHook preUnpack
+              tar xzf $src
+              unzip -q $cliZip -d cli
+              runHook postUnpack
+            '';
+            installPhase = ''
+              # PyInstaller onedir: _internal/ must sit next to each binary;
+              # the bootloader resolves it via the real executable path, so
+              # the bin/ entries can be symlinks.
+              mkdir -p $out/lib/mistral-vibe/acp $out/lib/mistral-vibe/cli $out/bin
+              cp -r vibe-acp _internal $out/lib/mistral-vibe/acp/
+              cp -r cli/vibe cli/_internal $out/lib/mistral-vibe/cli/
+              ln -s $out/lib/mistral-vibe/acp/vibe-acp $out/bin/vibe-acp
+              ln -s $out/lib/mistral-vibe/cli/vibe $out/bin/vibe
+            '';
+            meta.platforms = [ "x86_64-linux" "aarch64-linux" ];
+          };
+
           frontend = pkgs.buildNpmPackage {
             pname = "cydo-frontend";
             version = "0.1.0";
@@ -588,7 +642,7 @@ EOF
           };
         in
         {
-          inherit frontend backend backendDebug protocol-codegen codex-cli copilot-cli cydo cydoDebug cydoTest fake-bwrap screenshots;
+          inherit frontend backend backendDebug protocol-codegen codex-cli copilot-cli mistral-vibe cydo cydoDebug cydoTest fake-bwrap screenshots;
           default = cydo;
         });
 
