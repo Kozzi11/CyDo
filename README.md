@@ -177,6 +177,7 @@ Task type definitions are customizable and extensible with per-project or global
 | <img src="https://www.google.com/s2/favicons?domain=claude.ai&sz=32"         width="16" height="16" align="absmiddle"> &nbsp;&nbsp;[Claude Code](https://docs.anthropic.com/en/docs/claude-code) | ✅ Fully supported |
 | <img src="https://www.google.com/s2/favicons?domain=openai.com&sz=32"        width="16" height="16" align="absmiddle"> &nbsp;&nbsp;[OpenAI Codex CLI](https://github.com/openai/codex)           | ✅ Fully supported |
 | <img src="https://www.google.com/s2/favicons?domain=github.com&sz=32"        width="16" height="16" align="absmiddle"> &nbsp;&nbsp;[GitHub Copilot CLI](https://github.com/github/copilot-cli)   | 💥 Experimental    |
+| <img src="https://www.google.com/s2/favicons?domain=mistral.ai&sz=32"        width="16" height="16" align="absmiddle"> &nbsp;&nbsp;[Mistral Vibe](https://github.com/mistralai/mistral-vibe)           | 💥 Experimental    |
 | <img src="https://www.google.com/s2/favicons?domain=opencode.ai&sz=32"       width="16" height="16" align="absmiddle"> &nbsp;&nbsp;[OpenCode](https://github.com/sst/opencode)                   | ⏳ Planned         |
 | <img src="https://www.google.com/s2/favicons?domain=gemini.google.com&sz=32" width="16" height="16" align="absmiddle"> &nbsp;&nbsp;[Gemini CLI](https://github.com/google-gemini/gemini-cli)     | ⏳ Planned         |
 
@@ -303,6 +304,10 @@ agents:
   copilot:
     model_aliases:
       large: claude-opus-4.6   # copilot has no reasoning-effort knob; `effort` here is rejected at config load
+  vibe:
+    model_aliases:
+      large:
+        effort: high           # vibe maps this to its `thinking` config option (off/low/medium/high/max)
 ```
 
 `effort` values are passed to the underlying CLI verbatim, so the accepted values are whatever that CLI accepts.

@@ -37,7 +37,7 @@ bool driverSupportsEffort(AgentDriver driver)
 		case AgentDriver.claude:  return true;   // `--effort <value>`
 		case AgentDriver.codex:   return true;   // `model_reasoning_effort` config key
 		case AgentDriver.copilot: return false;  // no reasoning-effort knob
-		case AgentDriver.vibe:    return false;  // `thinking` config option, not a launch flag
+		case AgentDriver.vibe:    return true;   // `thinking` config option via session/set_config_option
 	}
 }
 

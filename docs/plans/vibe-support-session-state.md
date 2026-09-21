@@ -107,15 +107,62 @@ in 4 spec files.
   `rm result` if in the way.
 
 ## Next steps (in order)
-1. Follow-up work deferred from the plan (Part 4 remainder): vibe dialect
-   fixtures for the 32 `@no-vibe`-tagged spec files
-   (Ask/AskUser/SwitchMode/task-spawn/web-search), vibe resume-after-kill
-   race investigation with upstream, `translateHistoryLine`/
-   `enumerateAllSessions`, effort→thinking mapping (plan step 6), README
-   agent table row (step 8).
-2. Local cleanup (optional): probe homes/scripts/logs under /tmp
+1. Done this session (afternoon): Part 4 history parsing —
+   `translateHistoryLine` (persisted LLM-message lines → agnostic items,
+   turn synthesis), `extractPersistedHistoryBoundaries` (message_id
+   anchors, line:<n> fallback), `enumerateAllSessions`/`readSessionMeta`/
+   `matchProject` (session dirs + meta.json, full resumable session ids),
+   effort→thinking mapping via `session/set_config_option`
+   (`driverSupportsEffort(vibe)` flipped to true), plus the README agent
+   table row. In-file unit tests cover all of it.
+2. Also fixed this session (found via the gate):
+   - **Vibe tasks persisted status "active" after every turn.** Root
+     cause: ae promises defer `.then` handlers (`callSoon` = next tick),
+     and vibe's submission acceptance coincides with the session/prompt
+     *response* (turn END). The deferred acceptance
+     (`commitAcceptedBrowserSubmission` → `setStatus(active)`) ran after
+     the turn-result's active→alive transition and re-activated the idle
+     task. Every backend restart then treated the idle task as mid-turn
+     and sent a restart nudge (spurious extra turn). Fix: the driver
+     fulfills the submission promise, then emits the gated echo + turn
+     result on the *next tick* so the acceptance commits first — the
+     final persisted status is now "alive" (verified end-to-end with an
+     isolated local backend: status trajectory ends alive; the restarted
+     backend logs `status=alive` and takes the no-nudge resume path).
+     This bug existed before the history work; the new history
+     translation merely made the nudge's response visible
+     (resume.spec L231 failed with 2 assistant messages).
+   - session/load replay content (user/agent chunks, tool calls) is now
+     consumed silently — the persisted messages.jsonl is the transcript
+     source of truth, so replaying it after a history load would
+     duplicate every message. The compaction boundary pair is the one
+     replay event still emitted.
+   - `handleResumeMsg` could not resume a task whose status was already
+     "alive" — its `transitionTask` expectedFrom list excludes alive, and
+     alive→alive is not a legal transition, so the resume crashed the
+     backend ("Task transition origin mismatch"). Masked before by the
+     stale "active" status; the fix skips the no-op transition (clears
+     attention + broadcasts instead). continuation.spec L328 pinned it.
+   - `CYDO_CREATABLE_TYPES`/`CYDO_SWITCHMODES` null values are omitted
+     from the session/new MCP env (pydantic rejects null; the earlier
+     fix only covered CYDO_HANDOFFS — a latent bug whenever no task-type
+     context exists).
+3. Still deferred: vibe dialect fixtures for the 32 `@no-vibe`-tagged
+   spec files (Ask/AskUser/SwitchMode/task-spawn/web-search), untagging
+   the vibe-relevant history/import specs once they pass, vibe
+   resume-after-kill race investigation with upstream, fork/undo for
+   vibe (needs a session-dir + meta.json fork, not just jsonl rewriting —
+   see operations.d).
+4. Local cleanup (optional): probe homes/scripts/logs under /tmp
    (`/tmp/vibe-probe*`, `/tmp/r*.log`, `/tmp/flake-check*.log`,
-   `/tmp/vibe-gate-*.txt|json|log`), and the local backend config at
-   `~/.config/cydo/config.yaml` (points at /tmp/local-ws — remove or
-   restore your own). `example.yaml` at the repo root is the user's,
-   intentionally left uncommitted.
+   `/tmp/vibe-gate-*.txt|json|log`, `/tmp/vibe-repro/`), and the local
+   backend config at `~/.config/cydo/config.yaml` (points at
+   /tmp/local-ws — remove or restore your own). `example.yaml` at the
+   repo root is the user's, intentionally left uncommitted.
+5. NOTE from this session: the user's own CyDo backend was running on
+   port 3940 during local debugging (workspace /tmp/local-vibe-workspace,
+   `/tmp/local-vibe*`). Early local playwright attempts connected to it
+   and created two stray tasks there ("restart-alive" probes, ~tids
+   27-28) before I switched to an isolated port-3941 repro. Nothing in
+   ~/.local/share/cydo/cydo.db was touched (mtime Sep 19); the stray
+   tasks live in whatever data dir that backend uses — delete at will.

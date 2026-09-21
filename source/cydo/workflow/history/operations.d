@@ -36,9 +36,11 @@ HistoryOperations selectHistoryOperations(AgentDriver driver,
 		result.undo.agent_turn = HistoryOperationMechanism.jsonl;
 		return result;
 	case AgentDriver.vibe:
-		// No live/persisted history plumbing yet (Part 4): fork and undo
-		// stay unavailable instead of advertising jsonl operations that
-		// cannot resolve a history file.
+		// History parsing is wired (translateHistoryLine/boundaries), but
+		// fork and undo stay unavailable: the jsonl fork machinery rewrites
+		// only messages.jsonl, while a resumable vibe fork additionally
+		// needs a new session dir whose meta.json carries the forked
+		// session_id.
 		return result;
 	}
 	switch (codexForkSource)

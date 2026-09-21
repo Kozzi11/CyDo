@@ -1797,9 +1797,19 @@ class App
 			return;
 		if (taskSessionRunner.forkSourceOperationInProgress(tid))
 			return;
-		transitionTask(tid, [TaskStatus.pending, TaskStatus.active,
-			TaskStatus.waiting, TaskStatus.completed, TaskStatus.failed],
-			TaskStatus.alive, TaskNotificationChange.clearAttention);
+		// An idle task is already "alive" status-wise (alive→alive is not a
+		// legal transition); the resume then just clears attention and
+		// respawns the process.
+		if (td.status != TaskStatus.alive)
+			transitionTask(tid, [TaskStatus.pending, TaskStatus.active,
+				TaskStatus.waiting, TaskStatus.completed, TaskStatus.failed],
+				TaskStatus.alive, TaskNotificationChange.clearAttention);
+		else
+		{
+			td.needsAttention = false;
+			persistence.setNeedsAttention(tid, false);
+			broadcastTaskUpdate(tid);
+		}
 			td.processQueue.setGoal(ProcessState.Alive).then(() {
 				try
 					derivedTextJobs.generateSuggestions(tid);

@@ -22,8 +22,8 @@ version (unittest) import ae.sys.data : Data;
 version (unittest) import ae.utils.jsonrpc : JsonRpcError, JsonRpcErrorCode;
 
 import cydo.agent.contract : Agent, DiscoveredSession, InterruptedToolCallRepair,
-	OneShotHandle, PersistedHistoryBoundary, RewindResult, SessionConfig,
-	SessionMeta;
+	OneShotHandle, PersistedHistoryBoundary, PersistedHistoryBoundaryKind,
+	RewindResult, SessionConfig, SessionMeta;
 import cydo.agent.process : AgentProcess, FramingMode;
 import cydo.agent.session : AgentSession, AgentSubmissionReceipt;
 import cydo.protocol : ContentBlock, extractContentText, ItemCompletedEvent,
@@ -142,6 +142,47 @@ private struct PromptResponse
 private struct CancelParams
 {
 	string sessionId;
+}
+
+// session/set_config_option (stable, ACP v1): the string variant of the
+// config value serializes as a plain {value: "<id>"} object with no type
+// tag on the wire.
+private struct ConfigOptionValue
+{
+	string value;
+}
+
+private struct SetConfigOptionParams
+{
+	string sessionId;
+	string configId;
+	ConfigOptionValue value;
+}
+
+// Persisted LLM-message format (S5): one message per line in
+// messages.jsonl, `{"role": "user"|"assistant"|"tool", ...}`. Assistant
+// lines carry `content`, `reasoning_content` and `tool_calls` when present;
+// tool lines carry `content`, `name` and `tool_call_id`.
+@JSONPartial
+private struct VibeHistoryToolCallFunction
+{
+	string name;
+	@JSONOptional string arguments;
+}
+
+@JSONPartial
+private struct VibeHistoryToolCall
+{
+	string id;
+	@JSONName("function") VibeHistoryToolCallFunction function_;
+}
+
+@JSONPartial
+private struct VibeMetaFile
+{
+	string session_id;
+	@JSONOptional string origin_directory;
+	@JSONOptional string title;
 }
 
 @JSONPartial
@@ -804,11 +845,19 @@ class VibeAgent : Agent
 	void registerHistoryPath(string sessionId, string path,
 		const ref NativeHistoryProfile profile)
 	{
+		// Session dirs are named session_<ts>_<id8> — the timestamp prefix
+		// makes the full path non-derivable from the session ID alone, so a
+		// learned locator cannot be validated against a derivation. The live
+		// watch rescans by id8 prefix on demand instead.
 	}
 
 	string createHistoryForkDestination(string sessionId, string sourceHistoryPath,
 		const ref NativeHistoryProfile profile)
 	{
+		// Fork stays unavailable (selectHistoryOperations): the jsonl fork
+		// machinery rewrites only messages.jsonl, while a resumable vibe fork
+		// additionally needs a new session dir with a meta.json carrying the
+		// forked session_id.
 		return null;
 	}
 
@@ -816,36 +865,253 @@ class VibeAgent : Agent
 	{
 	}
 
+	// One persisted LLM message per line (S5); vibe-internal records carry
+	// injected=true and are not part of the transcript. Translation mirrors
+	// the live VibeSession shapes so history reload and live rendering agree:
+	// the vb-tool-<id> item ids pair tool results with their tool_use items,
+	// and a plain-content assistant message closes the turn because
+	// messages.jsonl has no explicit turn marker.
 	TranslatedEvent[] translateHistoryLine(string line, int lineNum)
 	{
-		return [];
+		import std.format : format;
+
+		@JSONPartial static struct RoleProbe
+		{
+			string role;
+			@JSONOptional string message_id;
+			@JSONOptional bool injected;
+		}
+		RoleProbe probe;
+		try probe = jsonParse!RoleProbe(line);
+		catch (Exception)
+			return [];
+		if (probe.injected)
+			return [];
+		// Lines without a message_id fall back to a line-number anchor,
+		// like Claude's history translation.
+		auto anchor = probe.message_id.length > 0 ? probe.message_id
+			: format!"line:%d"(lineNum);
+
+		TranslatedEvent[] events;
+		switch (probe.role)
+		{
+			case "user":
+			{
+				@JSONPartial static struct UserProbe { string content; }
+				UserProbe ev;
+				try ev = jsonParse!UserProbe(line);
+				catch (Exception)
+					return [];
+				if (ev.content.length == 0)
+					return [];
+				ContentBlock cb;
+				cb.type = "text";
+				cb.text = ev.content;
+				ItemStartedEvent startEv;
+				startEv.item_id = "vb-hist-user-" ~ anchor;
+				startEv.item_type = "user_message";
+				startEv.content = [cb];
+				startEv.uuid = probe.message_id;
+				events ~= TranslatedEvent(toJson(startEv), line);
+				break;
+			}
+			case "assistant":
+			{
+				@JSONPartial static struct AssistantProbe
+				{
+					@JSONOptional string content;
+					@JSONOptional string reasoning_content;
+					@JSONOptional JSONFragment tool_calls;
+				}
+				AssistantProbe ev;
+				try ev = jsonParse!AssistantProbe(line);
+				catch (Exception)
+					return [];
+
+				// Thinking precedes text, mirroring the live chunk order.
+				if (ev.reasoning_content.length > 0)
+				{
+					auto id = "vb-hist-think-" ~ anchor;
+					ItemStartedEvent thinkStartEv;
+					thinkStartEv.item_id = id;
+					thinkStartEv.item_type = "thinking";
+					ItemCompletedEvent thinkCompEv;
+					thinkCompEv.item_id = id;
+					thinkCompEv.text = ev.reasoning_content;
+					events ~= TranslatedEvent(toJson(thinkStartEv), line);
+					events ~= TranslatedEvent(toJson(thinkCompEv), line);
+				}
+				if (ev.content.length > 0)
+				{
+					auto id = "vb-hist-text-" ~ anchor;
+					ItemStartedEvent textStartEv;
+					textStartEv.item_id = id;
+					textStartEv.item_type = "text";
+					ItemCompletedEvent textCompEv;
+					textCompEv.item_id = id;
+					textCompEv.text = ev.content;
+					events ~= TranslatedEvent(toJson(textStartEv), line);
+					events ~= TranslatedEvent(toJson(textCompEv), line);
+				}
+				if (ev.tool_calls.json.length > 0 && ev.tool_calls.json != "null")
+				{
+					VibeHistoryToolCall[] calls;
+					try calls = jsonParse!(VibeHistoryToolCall[])(ev.tool_calls.json);
+					catch (Exception) {}
+					foreach (call; calls)
+					{
+						// Same naming contract as the live translation:
+						// cydo_<tool> MCP names decompose into the canonical
+						// name plus the cydo server.
+						auto name = call.function_.name.length > 0
+							? call.function_.name : "unknown";
+						ItemStartedEvent toolStartEv;
+						toolStartEv.item_id = "vb-tool-" ~ call.id;
+						toolStartEv.item_type = "tool_use";
+						if (name.startsWith("cydo_"))
+						{
+							toolStartEv.name = name[5 .. $];
+							toolStartEv.tool_server = "cydo";
+							toolStartEv.tool_source = "mcp";
+						}
+						else
+							toolStartEv.name = name;
+						toolStartEv.input = JSONFragment(
+							call.function_.arguments.length > 0
+								? call.function_.arguments : `{}`);
+						events ~= TranslatedEvent(toJson(toolStartEv), line);
+					}
+				}
+				// A plain-content assistant message terminates the turn:
+				// synthesize the live protocol's turn/stop + turn/result pair.
+				if (ev.content.length > 0)
+				{
+					TurnStopEvent stopEv;
+					events ~= TranslatedEvent(toJson(stopEv), line);
+					TurnResultEvent resultEv;
+					resultEv.subtype = "success";
+					resultEv.is_error = false;
+					resultEv.num_turns = 1;
+					resultEv.duration_ms = 0;
+					resultEv.total_cost_usd = 0.0;
+					resultEv.result = ev.content;
+					resultEv.usage = UsageInfo(0, 0);
+					events ~= TranslatedEvent(toJson(resultEv), line);
+				}
+				break;
+			}
+			case "tool":
+			{
+				@JSONPartial static struct ToolProbe
+				{
+					@JSONOptional string content;
+					@JSONOptional string tool_call_id;
+				}
+				ToolProbe ev;
+				try ev = jsonParse!ToolProbe(line);
+				catch (Exception)
+					return [];
+				if (ev.tool_call_id.length == 0)
+					return [];
+				auto id = "vb-tool-" ~ ev.tool_call_id;
+				ItemCompletedEvent compEv;
+				compEv.item_id = id;
+				events ~= TranslatedEvent(toJson(compEv), line);
+				ItemResultEvent resEv;
+				resEv.item_id = id;
+				resEv.content = JSONFragment(toJson(ev.content));
+				events ~= TranslatedEvent(toJson(resEv), line);
+				break;
+			}
+			default:
+				return [];
+		}
+		return events;
 	}
 
 	@property string lastMcpConfigPath() { return null; }
 
 	string rewriteSessionId(string line, string oldId, string newId)
 	{
+		// messages.jsonl carries per-message ids only; the session id lives
+		// in the sibling meta.json, which this line-level hook cannot rewrite.
 		return line;
 	}
 
 	PersistedHistoryBoundary[] extractPersistedHistoryBoundaries(string content,
 		int lineOffset = 0)
 	{
-		return [];
+		import std.format : format;
+		import std.string : lineSplitter;
+
+		PersistedHistoryBoundary[] ids;
+		int lineNum = lineOffset;
+		foreach (line; content.lineSplitter)
+		{
+			lineNum++;
+			if (line.length == 0)
+				continue;
+			try
+			{
+				@JSONPartial static struct BoundaryProbe
+				{
+					string role;
+					@JSONOptional string message_id;
+					@JSONOptional bool injected;
+				}
+				auto probe = jsonParse!BoundaryProbe(line);
+				if (probe.injected)
+					continue;
+				if (probe.role != "user" && probe.role != "assistant")
+					continue;
+				auto anchor = probe.message_id.length > 0 ? probe.message_id
+					: format!"line:%d"(lineNum);
+				ids ~= PersistedHistoryBoundary(anchor,
+					probe.role == "user" ? PersistedHistoryBoundaryKind.user
+						: PersistedHistoryBoundaryKind.agent_turn,
+					null, lineNum);
+			}
+			catch (Exception) {}
+		}
+		return ids;
 	}
 
 	InterruptedToolCallRepair repairInterruptedToolCall(string[] lines, string toolName,
 		string resultText)
 	{
+		// Vibe appends the tool record only after the tool settles, so an
+		// interrupted call leaves no partial record to repair.
 		return null;
 	}
 
 	bool forkIdMatchesLine(string line, int lineNum, string forkId)
 	{
-		return false;
+		if (forkId.startsWith("line:"))
+		{
+			import std.conv : to;
+			try
+				return lineNum == forkId["line:".length .. $].to!int;
+			catch (Exception)
+				return false;
+		}
+		@JSONPartial static struct IdProbe { @JSONOptional string message_id; }
+		try
+			return jsonParse!IdProbe(line).message_id == forkId;
+		catch (Exception)
+			return false;
 	}
 
-	bool isForkableLine(string line) { return false; }
+	bool isForkableLine(string line)
+	{
+		@JSONPartial static struct RoleProbe { string role; }
+		try
+		{
+			auto role = jsonParse!RoleProbe(line).role;
+			return role == "user" || role == "assistant";
+		}
+		catch (Exception)
+			return false;
+	}
 
 	TranslatedEvent[] translateLiveEvent(string rawLine)
 	{
@@ -886,12 +1152,34 @@ class VibeAgent : Agent
 
 	bool isUserMessageLine(string rawLine)
 	{
-		return false;
+		@JSONPartial static struct RoleProbe
+		{
+			string role;
+			@JSONOptional bool injected;
+		}
+		try
+		{
+			auto probe = jsonParse!RoleProbe(rawLine);
+			return probe.role == "user" && !probe.injected;
+		}
+		catch (Exception)
+			return false;
 	}
 
 	bool isAssistantMessageLine(string rawLine)
 	{
-		return false;
+		@JSONPartial static struct RoleProbe
+		{
+			string role;
+			@JSONOptional bool injected;
+		}
+		try
+		{
+			auto probe = jsonParse!RoleProbe(rawLine);
+			return probe.role == "assistant" && !probe.injected;
+		}
+		catch (Exception)
+			return false;
 	}
 
 	@property bool needsBash() { return true; }
@@ -905,19 +1193,121 @@ class VibeAgent : Agent
 		return RewindResult(false, "File revert is not supported for Vibe sessions");
 	}
 
+	// Vibe stores one session dir under
+	// $VIBE_HOME/logs/session/session_<ts>_<id8>/ with meta.json + messages.jsonl
+	// (S5). The dir name carries only the first 8 chars of the session UUID, so
+	// enumeration reads meta.json for the full resumable ID — one small JSON
+	// read per candidate dir.
 	DiscoveredSession[] enumerateAllSessions(const ref NativeHistoryProfile profile)
 	{
-		return [];
+		import std.file : DirEntry, dirEntries, exists, isDir, SpanMode,
+			timeLastModified;
+
+		enforce(profile.driver == driver,
+			"Vibe history profile driver does not match Mistral Vibe");
+		auto sessionsDir = buildPath(profile.root, "logs", "session");
+		if (!exists(sessionsDir) || !isDir(sessionsDir))
+			return [];
+
+		DiscoveredSession[] result;
+		try
+		{
+			foreach (DirEntry dirEntry;
+				dirEntries(sessionsDir, "session_*", SpanMode.shallow))
+			{
+				if (!dirEntry.isDir)
+					continue;
+				auto messagesPath = buildPath(dirEntry.name, "messages.jsonl");
+				if (!exists(messagesPath))
+					continue;
+				auto meta = readVibeMetaFile(
+					buildPath(dirEntry.name, "meta.json"));
+				// Without the full session ID the session cannot be resumed —
+				// a missing or unreadable meta.json disqualifies the dir.
+				if (meta.sessionId.length == 0)
+					continue;
+				DiscoveredSession ds;
+				ds.sessionId = meta.sessionId;
+				ds.mtime = timeLastModified(messagesPath).stdTime;
+				ds.projectPath = meta.originDirectory;
+				ds.exactHistoryPath = messagesPath;
+				result ~= ds;
+			}
+		}
+		catch (Exception e)
+		{
+			import std.logger : tracef;
+			tracef("enumerateAllSessions(vibe): error scanning %s: %s",
+				sessionsDir, e.msg);
+		}
+		return result;
 	}
 
 	SessionMeta readSessionMeta(const ref DiscoveredSession session)
 	{
-		return SessionMeta.init;
+		import std.path : dirName;
+		import cydo.foundation.text.title : truncateTitle;
+
+		if (session.exactHistoryPath.length == 0)
+			return SessionMeta.init;
+
+		SessionMeta meta;
+		auto fileMeta = readVibeMetaFile(
+			buildPath(dirName(session.exactHistoryPath), "meta.json"));
+		meta.title = fileMeta.title;
+		meta.projectPath = fileMeta.originDirectory;
+
+		// meta.json's title is nullable and defaults to "auto"; fall back to
+		// the first real user message, and count messages the same way.
+		import std.stdio : File;
+		try
+		{
+			int lineCount = 0;
+			auto f = File(session.exactHistoryPath, "r");
+			foreach (line; f.byLine)
+			{
+				if (lineCount++ > 50)
+					break;
+				string lineStr = cast(string) line.idup;
+				try
+				{
+					@JSONPartial static struct FirstUserProbe
+					{
+						string role;
+						@JSONOptional string content;
+						@JSONOptional bool injected;
+					}
+					auto probe = jsonParse!FirstUserProbe(lineStr);
+					if (probe.role != "user" || probe.injected)
+						continue;
+					meta.hasMessages = true;
+					if (meta.title.length == 0)
+						meta.title = truncateTitle(probe.content, 80);
+				}
+				catch (Exception) {}
+				if (meta.hasMessages && meta.title.length > 0)
+					break;
+			}
+		}
+		catch (Exception e)
+		{
+			import std.logger : tracef;
+			tracef("readSessionMeta(vibe, %s): error: %s",
+				session.sessionId, e.msg);
+		}
+		return meta;
 	}
 
 	string matchProject(const ref DiscoveredSession session,
 		const string[] knownProjectPaths)
 	{
+		// projectPath comes from meta.json's origin_directory at enumeration;
+		// this fallback only re-checks it against the known list.
+		if (session.projectPath.length == 0)
+			return "";
+		foreach (known; knownProjectPaths)
+			if (known == session.projectPath)
+				return known;
 		return "";
 	}
 
@@ -1032,8 +1422,10 @@ private McpServerStdio buildCydoMcpServer(int tid, SessionConfig config)
 	EnvVariable[] env;
 	env ~= EnvVariable("CYDO_TID", to!string(tid));
 	env ~= EnvVariable("CYDO_SOCKET", config.mcpSocketPath);
-	env ~= EnvVariable("CYDO_CREATABLE_TYPES", config.creatableTaskTypes);
-	env ~= EnvVariable("CYDO_SWITCHMODES", config.switchModes);
+	if (config.creatableTaskTypes !is null)
+		env ~= EnvVariable("CYDO_CREATABLE_TYPES", config.creatableTaskTypes);
+	if (config.switchModes !is null)
+		env ~= EnvVariable("CYDO_SWITCHMODES", config.switchModes);
 	if (config.handoffs !is null)
 		env ~= EnvVariable("CYDO_HANDOFFS", config.handoffs);
 	env ~= EnvVariable("CYDO_INCLUDE_TOOLS",
@@ -1074,6 +1466,63 @@ private string buildLoadSessionParams(int tid, string sessionId, string workDir,
 	return toJson(params);
 }
 
+/// Apply the launch `effort` parameter as vibe's `thinking` config option
+/// (off/low/medium/high/max per S8) once the session exists, then hand
+/// control to the ready path. An empty effort leaves vibe's configured
+/// default untouched. A rejected option fails the startup — mirroring how
+/// an invalid effort value fails the claude CLI at spawn.
+private void applyEffortOption(VibeAcpProcess server, string sessionId,
+	SessionConfig config, void delegate() onReady, void delegate(Exception) onFail)
+{
+	if (config.effort.length == 0)
+	{
+		onReady();
+		return;
+	}
+	SetConfigOptionParams params;
+	params.sessionId = sessionId;
+	params.configId = "thinking";
+	params.value = ConfigOptionValue(config.effort);
+	server.sendRequest("session/set_config_option", toJson(params))
+		.then((JsonRpcResponse resp) {
+			if (resp.isError)
+			{
+				onFail(new Exception(
+					"session/set_config_option error: " ~ resp.error.get.message));
+				return;
+			}
+			onReady();
+		}, (Exception e) { onFail(e); });
+}
+
+/// Read a session dir's meta.json (session_id, origin_directory, title).
+/// A missing or malformed file yields the default (empty sessionId), which
+/// callers treat as "not resumable".
+private struct VibeSessionMeta
+{
+	string sessionId;
+	string originDirectory;
+	string title;
+}
+
+private VibeSessionMeta readVibeMetaFile(string path)
+{
+	import std.file : exists, readText;
+
+	VibeSessionMeta result;
+	if (!exists(path))
+		return result;
+	try
+	{
+		auto meta = jsonParse!VibeMetaFile(readText(path));
+		result.sessionId = meta.session_id;
+		result.originDirectory = meta.origin_directory;
+		result.title = meta.title;
+	}
+	catch (Exception) {}
+	return result;
+}
+
 // ---------------------------------------------------------------------------
 // attachSession — spawn-side wiring, mirrors copilot.d's attachSession.
 // ---------------------------------------------------------------------------
@@ -1111,7 +1560,14 @@ private VibeSession attachSession(VibeAcpProcess server, int tid,
 							"session/load error: " ~ resp.error.get.message));
 						return;
 					}
-					session.onSessionStarted();
+					applyEffortOption(server, resumeSessionId, config, {
+						session.onSessionStarted();
+					}, (Exception e) {
+						session.stopReplay();
+						server.unregisterSession(resumeSessionId);
+						server.forgetSession(session);
+						session.handleStartupFailure(e);
+					});
 				}, (Exception e) {
 					session.stopReplay();
 					server.unregisterSession(resumeSessionId);
@@ -1147,7 +1603,13 @@ private VibeSession attachSession(VibeAcpProcess server, int tid,
 					}
 					session.adoptSessionId(sessionId);
 					server.registerSession(sessionId, session);
-					session.onSessionStarted();
+					applyEffortOption(server, sessionId, config, {
+						session.onSessionStarted();
+					}, (Exception e) {
+						server.unregisterSession(sessionId);
+						server.forgetSession(session);
+						session.handleStartupFailure(e);
+					});
 				}, (Exception e) {
 					server.forgetSession(session);
 					session.handleStartupFailure(e);
@@ -1174,7 +1636,7 @@ class VibeSession : AgentSession, VibeSessionHandler
 	private string agentName_;
 	private bool alive_;
 	private bool turnInProgress;
-	private bool replayMode; // true during session/load replay
+	private bool replayMode; // true during session/load replay; replayed content is consumed (persisted history is the transcript source)
 	private bool gracefulShutdown_; // true after closeStdin() — handleExit reports 0
 	private bool forcedStop_;       // true after stop() — handleExit always reports 1
 
@@ -1440,9 +1902,18 @@ class VibeSession : AgentSession, VibeSessionHandler
 					submission.settled = true;
 					submission.promise.fulfill(
 						AgentSubmissionReceipt.appServerAccepted);
-					releaseGatedUserEcho(submission);
-					emitTurnResult(response);
-					drainPendingMessages();
+					// The app commits the acceptance on the next tick (ae
+					// promises defer handlers). Vibe's acceptance coincides
+					// with the turn END, so the turn-result events must be
+					// emitted after that commit — otherwise the deferred
+					// acceptance re-activates the task the turn result just
+					// made idle, and the "active" status persists into every
+					// restart (which then nudges the "mid-turn" task).
+					onNextTick(socketManager, {
+						releaseGatedUserEcho(submission);
+						emitTurnResult(response);
+						drainPendingMessages();
+					});
 				}, (Exception e) {
 					if (submission.settled)
 						return;
@@ -1663,19 +2134,9 @@ class VibeSession : AgentSession, VibeSessionHandler
 		auto text = chunkText(update.content);
 		if (replayMode)
 		{
-			ContentBlock cb;
-			cb.type = "text";
-			cb.text = text;
-			ItemStartedEvent replayEv;
-			replayEv.item_id = "vb-user-" ~ (update.messageId.length > 0
-				? update.messageId
-				: activeTurnNamespace_ ~ "-" ~ to!string(nextItemIndex++));
-			replayEv.item_type = "user_message";
-			replayEv.content = [cb];
-			replayEv.is_replay = true;
-			if (update.messageId.length > 0)
-				replayEv.uuid = update.messageId;
-			emitEvent(toJson(replayEv), currentRawJson_);
+			// The persisted messages.jsonl is the transcript source of truth
+			// (loaded at task reload); re-emitting replayed content here
+			// would duplicate every reloaded message.
 			return;
 		}
 
@@ -1731,6 +2192,9 @@ class VibeSession : AgentSession, VibeSessionHandler
 
 	private void handleAgentChunk(VibeSessionUpdate update, string itemType)
 	{
+		// Replayed content is covered by the persisted history translation.
+		if (replayMode)
+			return;
 		auto text = chunkText(update.content);
 		if (activeTextItem.type != itemType
 			|| activeTextItem.sourceKey != update.messageId)
@@ -1769,6 +2233,11 @@ class VibeSession : AgentSession, VibeSessionHandler
 		// _meta.checkpoint_kind "compaction" — consume both halves; one
 		// session/compacted is emitted at completion (never match titles).
 		if (parseVibeMeta(update.meta).checkpointKind == "compaction")
+			return;
+		// Replayed tool calls are covered by the persisted history
+		// translation; their updates below no-op because the replayed call
+		// was never registered in activeTools.
+		if (replayMode)
 			return;
 
 		finalizeActiveTextItem();
@@ -2560,6 +3029,20 @@ unittest
 	foreach (entry; nullServer.env)
 		assert(entry.name != "CYDO_HANDOFFS");
 
+	// All three optional summaries null (no task type context): only the
+	// mandatory entries remain on the wire.
+	SessionConfig bare = SessionConfig.init;
+	bare.mcpSocketPath = "/tmp/sock";
+	auto bareParams = jsonParse!NewSessionProbe(
+		buildNewSessionParams(8, "/test/workdir", bare));
+	auto bareServer = bareParams.mcpServers[0];
+	assert(bareServer.env.length == 3);
+	assert(bareServer.env[0].name == "CYDO_TID");
+	assert(bareServer.env[1].name == "CYDO_SOCKET");
+	assert(bareServer.env[2] == EnvVariable("CYDO_INCLUDE_TOOLS", ""));
+	foreach (entry; bareServer.env)
+		assert(entry.value !is null);
+
 	// No MCP socket: no servers are delivered via the handshake.
 	config.mcpSocketPath = null;
 	assert(jsonParse!NewSessionProbe(
@@ -2919,9 +3402,10 @@ unittest
 
 unittest
 {
-	// session/load replay: updates arriving before the response are replayed
-	// (is_replay, no correlation); resume markers are consumed; the response
-	// ends replay mode and emits the synthetic session/init.
+	// session/load replay: content arriving before the response is consumed
+	// silently — the persisted messages.jsonl translation is the transcript
+	// source of truth and re-emitting replayed content would duplicate it.
+	// The response ends replay mode and emits the synthetic session/init.
 	auto connection = new TestVibeConnection;
 	auto server = makeTestVibeAcpProcess(connection);
 	auto session = attachSession(server, 8, "native-vibe-8", "test-model",
@@ -2939,23 +3423,40 @@ unittest
 
 	connection.receive(vibeUpdate("native-vibe-8",
 		`{"sessionUpdate":"user_message_chunk","messageId":"replay-m1","content":{"type":"text","text":"earlier question"}}`));
-	assert(emitted.length == 1);
-	auto replayItem = jsonParse!ItemStartedEvent(emitted[0]);
-	assert(replayItem.item_type == "user_message");
-	assert(replayItem.is_replay);
-	assert(replayItem.correlation_id is null);
-	assert(replayItem.content.length == 1
-		&& replayItem.content[0].text == "earlier question");
-	emitted = null;
+	connection.receive(vibeUpdate("native-vibe-8",
+		`{"sessionUpdate":"agent_message_chunk","messageId":"replay-m2","content":{"type":"text","text":"earlier answer"}}`));
+	connection.receive(vibeUpdate("native-vibe-8",
+		`{"sessionUpdate":"tool_call","toolCallId":"replay-t1","rawInput":{"command":"ls"},"_meta":{"tool_name":"bash"}}`));
+	connection.receive(vibeUpdate("native-vibe-8",
+		`{"sessionUpdate":"tool_call_update","toolCallId":"replay-t1","status":"completed","rawOutput":"done"}}`));
+	assert(emitted.length == 0);
 
 	connection.receive(vibeUpdate("native-vibe-8",
 		`{"sessionUpdate":"tool_call","toolCallId":"checkpoint:resume:0","_meta":{"tool_name":"think"}}`));
 	assert(emitted.length == 0);
 
+	connection.receive(vibeUpdate("native-vibe-8",
+		`{"sessionUpdate":"tool_call","toolCallId":"replay-compact","_meta":{"tool_name":"think","checkpoint_kind":"compaction"}}`));
+	connection.receive(vibeUpdate("native-vibe-8",
+		`{"sessionUpdate":"tool_call_update","toolCallId":"replay-compact","status":"completed","_meta":{"tool_name":"think","checkpoint_kind":"compaction"}}`));
+	// The compaction pair is the one replay event that survives: the compact
+	// boundary exists only on the wire, not in the source dir's messages.jsonl.
+	assert(emitted.length == 1
+		&& emitted[0].canFind(`"type":"session/compacted"`));
+
 	connection.respond(loadRequest, acceptedVibeResponse());
 	drainVibePromiseNextTicks();
 	assert(!session.replayMode && session.sessionReady_);
-	assert(emitted.length == 1 && emitted[0].canFind(`"type":"session/init"`));
+	assert(emitted.length == 2 && emitted[1].canFind(`"type":"session/init"`));
+
+	// Live content after the response streams normally.
+	emitted = null;
+	auto submission = new TestVibeSubmissionOutcome(
+		session.sendMessage([ContentBlock("text", "next turn")], "replay-nonce"));
+	auto promptRequest = connection.takeRequest("session/prompt");
+	connection.receive(vibeUpdate("native-vibe-8",
+		`{"sessionUpdate":"agent_message_chunk","messageId":"live-m1","content":{"type":"text","text":"next answer"}}`));
+	assert(emitted.length >= 2);
 }
 
 unittest
@@ -3329,4 +3830,271 @@ unittest
 
 	// Short ids never resolve.
 	assert(agent.historyPath("short", profile) is null);
+}
+
+unittest
+{
+	// History translation (Part 4): persisted LLM-message lines map to the
+	// same agnostic shapes the live session emits.
+	auto agent = new VibeAgent;
+
+	// A user line becomes one user_message item keyed by the persisted
+	// message_id.
+	auto user = agent.translateHistoryLine(
+		`{"role": "user", "content": "run command echo hi", "injected": false, "message_id": "u1"}`, 3);
+	assert(user.length == 1);
+	auto userItem = jsonParse!ItemStartedEvent(user[0].translated);
+	assert(userItem.item_type == "user_message");
+	assert(userItem.item_id == "vb-hist-user-u1");
+	assert(userItem.uuid == "u1");
+	assert(userItem.content.length == 1
+		&& userItem.content[0].text == "run command echo hi");
+	assert(user[0].raw.canFind("\"message_id\": \"u1\""));
+
+	// Without a message_id the line number becomes the anchor.
+	auto unkeyed = agent.translateHistoryLine(
+		`{"role": "user", "content": "hi", "injected": false}`, 7);
+	assert(unkeyed.length == 1);
+	assert(jsonParse!ItemStartedEvent(unkeyed[0].translated).item_id
+		== "vb-hist-user-line:7");
+
+	// An assistant text message: thinking + text items, then the synthesized
+	// turn/stop + turn/result pair that closes the turn.
+	auto assistant = agent.translateHistoryLine(
+		`{"role": "assistant", "content": "OK", "reasoning_content": "think first", "injected": false, "message_id": "a1"}`, 4);
+	assert(assistant.length == 6);
+	auto think = jsonParse!ItemStartedEvent(assistant[0].translated);
+	assert(think.item_type == "thinking" && think.item_id == "vb-hist-think-a1");
+	auto thinkDone = jsonParse!ItemCompletedEvent(assistant[1].translated);
+	assert(thinkDone.item_id == "vb-hist-think-a1" && thinkDone.text == "think first");
+	auto text = jsonParse!ItemStartedEvent(assistant[2].translated);
+	assert(text.item_type == "text" && text.item_id == "vb-hist-text-a1");
+	auto textDone = jsonParse!ItemCompletedEvent(assistant[3].translated);
+	assert(textDone.text == "OK");
+	assert(jsonParse!TurnStopEvent(assistant[4].translated).type == "turn/stop");
+	auto turnResult = jsonParse!TurnResultEvent(assistant[5].translated);
+	assert(turnResult.subtype == "success" && turnResult.result == "OK");
+
+	// A tool_calls message emits tool_use items with the live naming
+	// contract; the turn stays open (no turn/result without content).
+	auto toolCall = agent.translateHistoryLine(
+		`{"role": "assistant", "injected": false, "message_id": "a2", "tool_calls": [{"id": "call_1", "index": 0, "type": "function", "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}}]}`, 5);
+	assert(toolCall.length == 1);
+	auto toolItem = jsonParse!ItemStartedEvent(toolCall[0].translated);
+	assert(toolItem.item_type == "tool_use");
+	assert(toolItem.item_id == "vb-tool-call_1");
+	assert(toolItem.name == "bash" && toolItem.tool_server is null);
+	assert(toolItem.input.json == `{"command":"ls"}`);
+
+	// cydo_<tool> MCP names decompose into the canonical name + server.
+	auto cydoCall = agent.translateHistoryLine(
+		`{"role": "assistant", "injected": false, "message_id": "a3", "tool_calls": [{"id": "call_2", "index": 0, "type": "function", "function": {"name": "cydo_SwitchMode", "arguments": "{\"mode\":\"write\"}"}}]}`, 6);
+	auto cydoItem = jsonParse!ItemStartedEvent(cydoCall[0].translated);
+	assert(cydoItem.name == "SwitchMode");
+	assert(cydoItem.tool_server == "cydo" && cydoItem.tool_source == "mcp");
+
+	// A tool line completes its tool_use item with a text result.
+	auto toolResult = agent.translateHistoryLine(
+		`{"role": "tool", "content": "stdout: done", "injected": false, "name": "bash", "tool_call_id": "call_1"}`, 7);
+	assert(toolResult.length == 2);
+	auto comp = jsonParse!ItemCompletedEvent(toolResult[0].translated);
+	assert(comp.item_id == "vb-tool-call_1");
+	auto res = jsonParse!ItemResultEvent(toolResult[1].translated);
+	assert(res.item_id == "vb-tool-call_1");
+	assert(jsonParse!string(res.content.json) == "stdout: done");
+
+	// Vibe-internal (injected) records and malformed lines never translate.
+	assert(agent.translateHistoryLine(
+		`{"role": "user", "content": "internal", "injected": true, "message_id": "i1"}`, 8).length == 0);
+	assert(agent.translateHistoryLine(`not json`, 9).length == 0);
+	assert(agent.translateHistoryLine(`{"role": "system"}`, 10).length == 0);
+
+	// Empty-content user and tool lines without an id never translate.
+	assert(agent.translateHistoryLine(`{"role": "user", "content": ""}`, 11).length == 0);
+	assert(agent.translateHistoryLine(`{"role": "tool", "content": "x"}`, 12).length == 0);
+}
+
+unittest
+{
+	// History boundaries (Part 4): persisted anchors use message_id, with the
+	// Claude-style line:<n> fallback; injected records are excluded.
+	auto agent = new VibeAgent;
+	auto userLine = `{"role": "user", "content": "hello", "injected": false, "message_id": "u1"}`;
+	auto injectedLine = `{"role": "user", "content": "internal", "injected": true, "message_id": "i1"}`;
+	auto assistantLine = `{"role": "assistant", "content": "hi", "injected": false, "message_id": "a1"}`;
+	auto toolLine = `{"role": "tool", "content": "out", "injected": false, "tool_call_id": "c1"}`;
+	auto content = userLine ~ "\n" ~ injectedLine ~ "\n" ~ assistantLine ~ "\n"
+		~ toolLine ~ "\n" ~ `{"role": "user", "content": "plain", "injected": false}` ~ "\n";
+	auto boundaries = agent.extractPersistedHistoryBoundaries(content);
+	assert(boundaries.length == 3);
+	assert(boundaries[0] == PersistedHistoryBoundary("u1",
+		PersistedHistoryBoundaryKind.user, null, 1));
+	assert(boundaries[1] == PersistedHistoryBoundary("a1",
+		PersistedHistoryBoundaryKind.agent_turn, null, 3));
+	assert(boundaries[2].anchor == "line:5");
+	assert(boundaries[2].kind == PersistedHistoryBoundaryKind.user);
+	assert(boundaries[2].sourceLine == 5);
+
+	// lineOffset shifts the source lines (used for tail re-scans).
+	auto shifted = agent.extractPersistedHistoryBoundaries(content, 100);
+	assert(shifted[2].anchor == "line:105");
+
+	// Line predicates and fork anchors agree with the boundary extraction.
+	assert(agent.isUserMessageLine(userLine));
+	assert(!agent.isUserMessageLine(injectedLine));
+	assert(!agent.isUserMessageLine(assistantLine));
+	assert(agent.isAssistantMessageLine(assistantLine));
+	assert(!agent.isAssistantMessageLine(toolLine));
+	assert(agent.isForkableLine(userLine) && agent.isForkableLine(assistantLine));
+	assert(!agent.isForkableLine(toolLine));
+	assert(agent.forkIdMatchesLine(userLine, 1, "u1"));
+	assert(!agent.forkIdMatchesLine(userLine, 1, "a1"));
+	// line:<n> anchors match by physical line number, like Claude's.
+	assert(agent.forkIdMatchesLine(userLine, 5, "line:5"));
+	assert(!agent.forkIdMatchesLine(userLine, 1, "line:5"));
+	assert(!agent.forkIdMatchesLine(`not json`, 1, "u1"));
+}
+
+unittest
+{
+	// Session discovery (Part 4): session dirs need messages.jsonl plus a
+	// meta.json carrying the full resumable session ID; project matching uses
+	// meta.json's origin_directory.
+	import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir, write;
+	import std.path : buildPath;
+
+	auto root = buildPath(tempDir(), "cydo-vibe-history-sessions");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+
+	auto sessionsDir = buildPath(root, "home", ".vibe", "logs", "session");
+	auto dirA = buildPath(sessionsDir, "session_20260101_010101_aaaa1111");
+	mkdirRecurse(dirA);
+	write(buildPath(dirA, "meta.json"),
+		`{"session_id": "aaaa1111-2222-3333-4444-555566667777",` ~ "\n"
+		~ ` "origin_directory": "/work/proj", "title": null, "parent_session_id": null}`);
+	write(buildPath(dirA, "messages.jsonl"),
+		`{"role": "user", "content": "hello vibe", "injected": false, "message_id": "m1"}` ~ "\n");
+	// No messages.jsonl: not a transcript dir.
+	mkdirRecurse(buildPath(sessionsDir, "session_20260102_020202_bbbb2222"));
+	// No meta.json: the session ID is not resumable.
+	auto dirC = buildPath(sessionsDir, "session_20260103_030303_cccc3333");
+	mkdirRecurse(dirC);
+	write(buildPath(dirC, "messages.jsonl"), `{"role": "user", "content": "x"}` ~ "\n");
+	// A titled session with a later user message.
+	auto dirD = buildPath(sessionsDir, "session_20260104_040404_dddd4444");
+	mkdirRecurse(dirD);
+	write(buildPath(dirD, "meta.json"),
+		`{"session_id": "dddd4444-3333-2222-1111-000099998888", "origin_directory": "/work/other", "title": "Named session"}`);
+	write(buildPath(dirD, "messages.jsonl"),
+		`{"role": "user", "content": "second message with longer text", "injected": false}` ~ "\n");
+
+	auto agent = new VibeAgent;
+	auto profile = NativeHistoryProfile(AgentDriver.vibe,
+		buildPath(root, "home", ".vibe"));
+	auto sessions = agent.enumerateAllSessions(profile);
+	assert(sessions.length == 2);
+	// dirEntries yields filesystem order; key by session ID instead.
+	DiscoveredSession[string] byId;
+	foreach (ref ds; sessions)
+		byId[ds.sessionId] = ds;
+	assert("aaaa1111-2222-3333-4444-555566667777" in byId);
+	assert("dddd4444-3333-2222-1111-000099998888" in byId);
+	auto sessionA = byId["aaaa1111-2222-3333-4444-555566667777"];
+	assert(sessionA.projectPath == "/work/proj");
+	assert(sessionA.exactHistoryPath.canFind("messages.jsonl"));
+
+	// meta.json's title wins; a null title falls back to the first user
+	// message; origin_directory becomes the project path.
+	auto metaA = agent.readSessionMeta(sessionA);
+	assert(metaA.title == "hello vibe");
+	assert(metaA.projectPath == "/work/proj");
+	assert(metaA.hasMessages);
+	auto metaD = agent.readSessionMeta(
+		byId["dddd4444-3333-2222-1111-000099998888"]);
+	assert(metaD.title == "Named session");
+	assert(metaD.projectPath == "/work/other");
+	assert(metaD.hasMessages);
+
+	assert(agent.matchProject(sessionA, ["/work/other", "/work/proj"]) == "/work/proj");
+	assert(agent.matchProject(sessionA, ["/work/other"]) == "");
+	assert(agent.matchProject(sessionA, []) == "");
+}
+
+unittest
+{
+	// Effort mapping (Part 4, plan step 6): a configured effort applies as
+	// the `thinking` config option before the session becomes ready; a
+	// rejected option fails the startup.
+	auto connection = new TestVibeConnection;
+	auto server = makeTestVibeAcpProcess(connection);
+	SessionConfig config;
+	config.effort = "high";
+	auto session = attachSession(server, 12, null, "test-model",
+		"/test/workdir", config);
+
+	string[] emitted;
+	session.onOutput = (TranslatedEvent event) {
+		emitted ~= event.translated;
+	};
+
+	auto newRequest = connection.takeRequest("session/new");
+	connection.respond(newRequest,
+		acceptedVibeResponse(`{"sessionId":"effort-session"}`));
+	drainVibePromiseNextTicks();
+	// Not started yet: the option request is still pending.
+	assert(!session.sessionReady_);
+
+	auto optionRequest = connection.takeRequest("session/set_config_option");
+	auto optionParams = jsonParse!SetConfigOptionParams(toJson(optionRequest.params));
+	assert(optionParams.sessionId == "effort-session");
+	assert(optionParams.configId == "thinking");
+	assert(optionParams.value.value == "high");
+	assert(emitted.length == 0);
+
+	connection.respond(optionRequest, acceptedVibeResponse(`{"configOptions":[]}`));
+	drainVibePromiseNextTicks();
+	assert(session.sessionReady_);
+	assert(emitted.length == 1 && emitted[0].canFind(`"type":"session/init"`));
+
+	// An empty effort never sends the option request (all existing tests run
+	// with SessionConfig.init and no option request appears).
+	auto plainFixture = makeReadyVibeSession(13);
+	assert(plainFixture.session.sessionReady_);
+}
+
+unittest
+{
+	// Effort rejection (Part 4, plan step 6): a refused thinking option
+	// fails the startup and the pending submission drains with the error.
+	auto connection = new TestVibeConnection;
+	auto server = makeTestVibeAcpProcess(connection);
+	SessionConfig config;
+	config.effort = "banana";
+	auto session = attachSession(server, 14, null, "test-model",
+		"/test/workdir", config);
+
+	string[] emitted;
+	session.onOutput = (TranslatedEvent event) {
+		emitted ~= event.translated;
+	};
+	auto queued = new TestVibeSubmissionOutcome(
+		session.sendMessage([ContentBlock("text", "queued")], "queued-nonce"));
+	assertVibePending(queued);
+
+	auto newRequest = connection.takeRequest("session/new");
+	connection.respond(newRequest,
+		acceptedVibeResponse(`{"sessionId":"effort-fail-session"}`));
+	drainVibePromiseNextTicks();
+	auto optionRequest = connection.takeRequest("session/set_config_option");
+	connection.respond(optionRequest,
+		rejectedVibeResponse("Invalid thinking value"));
+	drainVibePromiseNextTicks();
+	assertVibeRejectedOnce(queued,
+		"session/set_config_option error: Invalid thinking value");
+	assert(!session.alive_ && !session.sessionReady_);
+	assert(emitted.length == 0);
 }
