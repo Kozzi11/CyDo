@@ -8,8 +8,7 @@ import {
   assistantText,
 } from "./fixtures";
 
-test("history survives page reload",
-    { tag: "@no-vibe" }, async ({ page, agentType }) => {
+test("history survives page reload", async ({ page, agentType }) => {
   await enterSession(page);
   await sendMessage(page, 'Please reply with "persistent"');
 
@@ -34,8 +33,7 @@ test("history survives page reload",
   ).toBeVisible();
 });
 
-test("no duplicate messages after reload",
-    { tag: "@no-vibe" }, async ({ page, agentType }) => {
+test("no duplicate messages after reload", async ({ page, agentType }) => {
   await enterSession(page);
   await sendMessage(page, 'Please reply with "nodups"');
 
@@ -100,7 +98,7 @@ test("resumed session starts in idle state", async ({ page, agentType }) => {
   await expect(page.locator(".btn-send").first()).toBeEnabled();
 });
 
-test("session resume continues conversation", { tag: "@no-vibe" }, async ({ page, agentType }) => {
+test("session resume continues conversation", async ({ page, agentType }) => {
   await enterSession(page);
   await sendMessage(page, 'Please reply with "pre-resume"');
 
@@ -127,7 +125,7 @@ test("session resume continues conversation", { tag: "@no-vibe" }, async ({ page
   });
 });
 
-test("sending message to stopped session auto-resumes it", { tag: "@no-vibe" }, async ({
+test("sending message to stopped session auto-resumes it", async ({
   page,
   agentType,
 }) => {

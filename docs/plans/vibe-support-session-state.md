@@ -147,12 +147,27 @@ in 4 spec files.
      from the session/new MCP env (pydantic rejects null; the earlier
      fix only covered CYDO_HANDOFFS — a latent bug whenever no task-type
      context exists).
-3. Still deferred: vibe dialect fixtures for the 32 `@no-vibe`-tagged
-   spec files (Ask/AskUser/SwitchMode/task-spawn/web-search), untagging
-   the vibe-relevant history/import specs once they pass, vibe
-   resume-after-kill race investigation with upstream, fork/undo for
-   vibe (needs a session-dir + meta.json fork, not just jsonl rewriting —
-   see operations.d).
+3. Still deferred:
+   - Vibe dialect fixtures for the remaining `@no-vibe`-tagged specs. The
+     chat-completions dialect maps text/shell/tool_call/multi_tool_call/
+     stall and answers every tool result with "Done." — the Ask/AskUser/
+     SwitchMode/task-spawn families need tool-result-aware second
+     responses (mirror the Anthropic handler's `findOriginalUserText`
+     sequences in `handleChatCompletions`).
+   - `history-order.spec L29` (user message above assistant in DOM):
+     vibe's acceptance arrives at turn END, so the user echo lands after
+     the assistant chunks — needs the acceptance/display ordering
+     redesigned (retagged with a comment).
+   - `resume.spec L301` (MCP tools after backend restart): needs the
+     task-spawn dialect (retagged with a comment).
+   - vibe resume-after-kill race investigation with upstream, fork/undo
+     for vibe (needs a session-dir + meta.json fork, not just jsonl
+     rewriting — see operations.d).
+   - Untagged this session and now PASSING for vibe: session-lifecycle
+     "history survives page reload", "no duplicate messages after
+     reload", "session resume continues conversation", "sending message
+     to stopped session auto-resumes it" — the killed-session race did
+     not reproduce in these flows.
 4. Local cleanup (optional): probe homes/scripts/logs under /tmp
    (`/tmp/vibe-probe*`, `/tmp/r*.log`, `/tmp/flake-check*.log`,
    `/tmp/vibe-gate-*.txt|json|log`, `/tmp/vibe-repro/`), and the local

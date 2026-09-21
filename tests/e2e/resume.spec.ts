@@ -299,6 +299,7 @@ test("idle task is not nudged after resume + restart", { tag: "@no-codex" }, asy
 });
 
 test("MCP tools work after backend restart",
+    // Vibe: needs the chat-completions task-spawn dialect in the mock API.
     { tag: "@no-vibe" }, async ({
   page,
   restartableBackend,
