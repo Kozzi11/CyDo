@@ -298,7 +298,8 @@ test("idle task is not nudged after resume + restart", { tag: "@no-codex" }, asy
   await expect(page.locator(".message.assistant-message")).toHaveCount(1);
 });
 
-test("MCP tools work after backend restart", async ({
+test("MCP tools work after backend restart",
+    { tag: "@no-vibe" }, async ({
   page,
   restartableBackend,
 }) => {

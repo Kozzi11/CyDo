@@ -7,7 +7,8 @@ import {
   assistantText,
 } from "./fixtures";
 
-test("suggestions appear after agent responds", async ({ page, agentType }) => {
+test("suggestions appear after agent responds",
+    { tag: "@no-vibe" }, async ({ page, agentType }) => {
   await enterSession(page);
   await sendMessage(page, 'Please reply with "done"');
 
@@ -26,7 +27,8 @@ test("suggestions appear after agent responds", async ({ page, agentType }) => {
   expect(count).toBeLessThanOrEqual(3);
 });
 
-test("suggestions disappear when user types", async ({ page, agentType }) => {
+test("suggestions disappear when user types",
+    { tag: "@no-vibe" }, async ({ page, agentType }) => {
   await enterSession(page);
   await sendMessage(page, 'Please reply with "done"');
 
@@ -48,7 +50,8 @@ test("suggestions disappear when user types", async ({ page, agentType }) => {
   await expect(suggestions.first()).toBeVisible();
 });
 
-test("clicking suggestion sends it immediately", async ({
+test("clicking suggestion sends it immediately",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {
@@ -81,7 +84,8 @@ test("clicking suggestion sends it immediately", async ({
   await expect(input).toHaveValue("");
 });
 
-test("shift+click suggestion pre-fills input without sending", async ({
+test("shift+click suggestion pre-fills input without sending",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {

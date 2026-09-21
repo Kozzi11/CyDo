@@ -119,6 +119,7 @@ const isShellTool = (
     toolServer,
     "claude/Bash",
     "copilot/bash",
+    "vibe/bash",
     "codex/commandExecution",
     "codex/local_shell_call",
     "codex/exec_command",
@@ -2849,10 +2850,12 @@ const defaultExpandedTools = new Set([
   "claude/TaskUpdate",
   "claude/NotebookEdit",
   "copilot/bash",
+  "vibe/bash",
 ]);
 const defaultExpandedResults = new Set([
   "claude/Bash",
   "copilot/bash",
+  "vibe/bash",
   "cydo:Bash", // Copilot calls CyDo's cydo-Bash MCP tool, which arrives as name="Bash", toolServer="cydo"
   "codex/commandExecution",
   "codex/local_shell_call",

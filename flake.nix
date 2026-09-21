@@ -653,6 +653,7 @@ EOF
           cydoDebug = self.packages.${system}.cydoTest;
           codex = self.packages.${system}.codex-cli;
           copilot = self.packages.${system}.copilot-cli;
+          mistral-vibe = self.packages.${system}.mistral-vibe;
 
           # Fake bwrap that strips sandbox flags and exec's the inner command.
           # Real bwrap can't run inside Nix's build sandbox.
@@ -840,6 +841,42 @@ EOF
               export COPILOT_GITHUB_TOKEN=gho_mock_oauth_token
               ''}
 
+              ${lib.optionalString (agentType == "vibe") ''
+              # Vibe generic backend: point the active model at the mock API's
+              # OpenAI-compatible chat endpoint. MCP rides in `session/new`, so
+              # no mcp_servers entry is needed. Permissions: allow bash so the
+              # sandboxed session never blocks on a TTY prompt.
+              mkdir -p /tmp/vibe-test-home
+              export VIBE_HOME=/tmp/vibe-test-home
+              export MISTRAL_API_KEY=test-key-mock
+              cat > $VIBE_HOME/config.toml <<'VIBECFG'
+              enable_update_checks = false
+              enable_telemetry = false
+              active_model = "mock"
+
+              [[providers]]
+              name = "mock"
+              api_base = "http://127.0.0.1:9000/v1"
+              api_key_env_var = "MISTRAL_API_KEY"
+              api_style = "openai"
+              backend = "generic"
+
+              [[models]]
+              name = "mock-model"
+              provider = "mock"
+              alias = "mock"
+              temperature = 0.2
+              thinking = "off"
+              auto_compact_threshold = 200000
+
+              [tools.bash]
+              permission = "always"
+              VIBECFG
+              cat > $VIBE_HOME/trusted_folders.toml <<VIBETRUST
+              trusted = ["/tmp/cydo-test-workspace"]
+              VIBETRUST
+              ''}
+
               mkdir -p /tmp/fake-bin
               ln -sf ${fake-bwrap} /tmp/fake-bin/bwrap
               ln -sf ${fail-claude} /tmp/fake-bin/fail-claude
@@ -848,6 +885,11 @@ EOF
 
               ${lib.optionalString (agentType == "copilot") ''
               ln -sf ${copilot}/bin/copilot /tmp/fake-bin/copilot
+              ''}
+
+              ${lib.optionalString (agentType == "vibe") ''
+              ln -sf ${mistral-vibe}/bin/vibe-acp /tmp/fake-bin/vibe-acp
+              ln -sf ${mistral-vibe}/bin/vibe /tmp/fake-bin/vibe
               ''}
 
               mkdir -p /tmp/playwright-home/.config/cydo
@@ -953,6 +995,7 @@ EOF
             claude  = { agentType = "claude"; claudeBin = null; extraNativeBuildInputs = []; };
             codex   = { agentType = "codex";  claudeBin = null; extraNativeBuildInputs = []; };
             copilot = { agentType = "copilot"; claudeBin = null; extraNativeBuildInputs = [ copilot ]; };
+            vibe    = { agentType = "vibe";   claudeBin = null; extraNativeBuildInputs = [ mistral-vibe ]; };
             failure = { agentType = "claude"; claudeBin = "fail-claude"; extraNativeBuildInputs = []; };
           };
 
@@ -981,7 +1024,7 @@ EOF
               && !(builtins.elem agent forbidAgents);
 
           # Drift guard: fail at eval time if any tag names an unknown agent.
-          knownAgents = [ "claude" "codex" "copilot" ];
+          knownAgents = [ "claude" "codex" "copilot" "vibe" ];
           allTagAgents = lib.unique (lib.concatMap (t:
             (map (lib.removeSuffix "-only")
                  (builtins.filter (s: lib.hasSuffix "-only" s) t.tags))

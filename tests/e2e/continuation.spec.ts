@@ -240,7 +240,8 @@ function assertRepairedContinuationHistory(
   }
 }
 
-test("keep_context continuation injects prompt template", async ({
+test("keep_context continuation injects prompt template",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {
@@ -282,7 +283,8 @@ test("keep_context continuation injects prompt template", async ({
   }
 });
 
-test("keep_context SwitchMode preface uses continuation key", async ({
+test("keep_context SwitchMode preface uses continuation key",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {
@@ -301,7 +303,8 @@ test("keep_context SwitchMode preface uses continuation key", async ({
   ).toBeVisible();
 });
 
-test("mode switch replay rebuilds known system message metadata", async ({
+test("mode switch replay rebuilds known system message metadata",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {
@@ -356,7 +359,8 @@ test("unsent steer is either recovered into input box or shown in history after 
   }).toPass();
 });
 
-test("handoff continuation exit navigates to grandparent, not completed parent", async ({
+test("handoff continuation exit navigates to grandparent, not completed parent",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {
@@ -465,7 +469,8 @@ test("handoff continuation exit navigates to grandparent, not completed parent",
   }
 });
 
-test("handoff replay rebuilds known system message metadata", async ({
+test("handoff replay rebuilds known system message metadata",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {
@@ -533,7 +538,8 @@ test("handoff replay rebuilds known system message metadata", async ({
   ).toBeVisible({ timeout });
 });
 
-test("SwitchMode from sub-task sends is_continuation flag", async ({
+test("SwitchMode from sub-task sends is_continuation flag",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {
@@ -593,7 +599,8 @@ test("SwitchMode from sub-task sends is_continuation flag", async ({
   }).toPass({ timeout });
 });
 
-test("on_yield continuation auto-fires on clean exit", async ({
+test("on_yield continuation auto-fires on clean exit",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {
@@ -636,7 +643,7 @@ test("on_yield continuation auto-fires on clean exit", async ({
   }).toPass();
 });
 
-test("on_yield does not fire on non-zero exit", { tag: "@no-codex" }, async ({ page, agentType }) => {
+test("on_yield does not fire on non-zero exit", { tag: ["@no-codex", "@no-vibe"] }, async ({ page, agentType }) => {
   // Keep Codex skipped for now: in this mocked stall path, Codex/mock behavior
   // is not yet deterministic enough to keep the child stalled until kill assertion.
 
@@ -702,7 +709,8 @@ test("on_yield does not fire on non-zero exit", { tag: "@no-codex" }, async ({ p
   expect(continuationCreated).toBeFalsy();
 });
 
-test("input box stays empty after mode switch", async ({ page, agentType }) => {
+test("input box stays empty after mode switch",
+    { tag: "@no-vibe" }, async ({ page, agentType }) => {
   const liveInterruptionUuids: string[] = [];
   const continuationReloads: ContinuationReload[] = [];
   page.on("websocket", (ws) => {

@@ -142,7 +142,8 @@ test(
   },
 );
 
-test("all agents publish canonical boundary replacements without duplicate transcript messages", async ({
+test("all agents publish canonical boundary replacements without duplicate transcript messages",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {

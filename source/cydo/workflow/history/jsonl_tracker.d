@@ -114,6 +114,11 @@ struct JsonlTracker
 		else return;
 		if (tid !in boundaryState)
 			boundaryState[tid] = BoundaryReconcileState.init;
+		// Tasks without a live history watch (no live context attached) have
+		// no persisted counterpart to reconcile against — skip boundary
+		// bookkeeping entirely.
+		if (tid !in liveContexts)
+			return;
 		if (requireLiveContext(tid).agent.driver == AgentDriver.codex && isContextBootstrap
 			&& kind == PersistedHistoryBoundaryKind.user)
 			return;

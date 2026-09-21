@@ -201,7 +201,8 @@ function createImportWorkDir(suffix: string): { workDir: string; workerHome: str
   return { workDir, workerHome };
 }
 
-test("edit raw JSON event persists to disk across reload", async ({
+test("edit raw JSON event persists to disk across reload",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {
@@ -224,7 +225,8 @@ test("edit raw JSON event persists to disk across reload", async ({
   expect(reopenedValue).toContain(marker);
 });
 
-test("clearing raw JSON deletes the source line instead of writing null", async ({
+test("clearing raw JSON deletes the source line instead of writing null",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {
@@ -245,7 +247,8 @@ test("clearing raw JSON deletes the source line instead of writing null", async 
   expect(rewrittenFile.length).toBeLessThan(originalFile.length);
 });
 
-test("editing raw JSON to two top-level objects expands into two history lines", async ({
+test("editing raw JSON to two top-level objects expands into two history lines",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {
@@ -272,7 +275,8 @@ test("editing raw JSON to two top-level objects expands into two history lines",
   expect(rawLines.filter((line) => line.includes(secondText))).toHaveLength(1);
 });
 
-test("invalid raw JSON edit is rejected and leaves the JSONL file unchanged", async ({
+test("invalid raw JSON edit is rejected and leaves the JSONL file unchanged",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {

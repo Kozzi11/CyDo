@@ -90,7 +90,7 @@ test("session-start system message stays collapsed after reload", { tag: "@no-co
   ).toBeVisible();
 });
 
-test("task prompt system message keeps task type label after reload", { tag: "@no-codex" }, async ({
+test("task prompt system message keeps task type label after reload", { tag: ["@no-codex", "@no-vibe"] }, async ({
   page,
   agentType,
 }) => {

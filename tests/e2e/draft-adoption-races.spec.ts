@@ -393,7 +393,8 @@ test("direct persisted draft route adopts after its initial task snapshot", asyn
   expect(proxy.deleteRequests).toEqual([tid]);
 });
 
-test("held incremental bootstrap keeps an archived child route truthful", async ({
+test("held incremental bootstrap keeps an archived child route truthful",
+    { tag: "@no-vibe" }, async ({
   page,
   browser,
   baseURL,

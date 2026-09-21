@@ -26,7 +26,8 @@ import {
   assistantText,
 } from "./fixtures";
 
-test("user message appears above assistant response during live session", async ({
+test("user message appears above assistant response during live session",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {

@@ -1404,6 +1404,149 @@ function handleMessages(req, res) {
   });
 }
 
+// OpenAI Chat Completions API (Mistral Vibe generic backend).
+//
+// Vibe speaks vanilla OpenAI chat: `{model, stream, messages, tools}` where
+// messages are `{role, content}` with `tool_calls` on assistant turns and
+// `{role: "tool", tool_call_id, name, content}` for results. Tool names are
+// the vibe-side names (`bash`, `cydo_Task`, ...) — MCP tools arrive as
+// `{server}_{tool}` per vibe's naming contract, so CyDo's MCP tools are
+// `cydo_<Tool>` on this wire (the driver decomposes the prefix).
+function chatToolCall(name, input) {
+  return {
+    index: 0,
+    id: nextCallId(),
+    type: "function",
+    function: { name, arguments: JSON.stringify(input) },
+  };
+}
+
+function handleChatCompletions(req, res) {
+  let body = "";
+  req.on("data", (chunk) => (body += chunk));
+  req.on("end", () => {
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid JSON" }));
+      return;
+    }
+
+    const messages = parsed.messages || [];
+    const requestedModel = parsed.model || "unknown";
+    const last = messages[messages.length - 1] || {};
+    const isToolResult = last.role === "tool";
+
+    // Last user text — vibe's system prompt rides in a `system` message, so
+    // matching against the last non-tool message is sufficient for fixtures.
+    let userText = null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user" && typeof messages[i].content === "string") {
+        userText = messages[i].content;
+        break;
+      }
+    }
+    const intent = userText === null ? null : matchPattern(userText);
+    console.log(
+      `[mock-api] [chat] model=${requestedModel} userText=${JSON.stringify(userText)} isToolResult=${isToolResult} msgCount=${messages.length}`,
+    );
+
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    const emit = (delta, finish) =>
+      res.write(
+        `data: ${JSON.stringify({
+          id: nextRespId(),
+          object: "chat.completion.chunk",
+          created: 1,
+          model: requestedModel,
+          choices: [{ index: 0, delta, finish_reason: finish ?? null }],
+        })}\n\n`,
+      );
+    const emitText = (text) => {
+      emit({ role: "assistant", content: text });
+      emit({}, "stop");
+    };
+    const emitToolCall = (name, input) => {
+      emit({ role: "assistant", tool_calls: [chatToolCall(name, input)] }, "tool_calls");
+    };
+    const finishStream = () => {
+      res.write(
+        `data: ${JSON.stringify({
+          id: nextRespId(),
+          object: "chat.completion.chunk",
+          created: 1,
+          model: requestedModel,
+          choices: [],
+          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        })}\n\n`,
+      );
+      res.write("data: [DONE]\n\n");
+      res.end();
+    };
+
+    // After a tool result, acknowledge so the turn can complete. Multi-step
+    // fixtures are out of scope for the vibe project; every other driver
+    // covers them.
+    if (isToolResult) {
+      emitText("Done.");
+      finishStream();
+      return;
+    }
+
+    if (intent === null) {
+      emitText("Done.");
+      finishStream();
+      return;
+    }
+
+    // Map intents to chat-completions responses. Vibe's bash tool takes
+    // {command}; MCP tool calls use the vibe-side `cydo_<Tool>` name.
+    if (intent.type === "text") {
+      emitText(intent.text);
+      finishStream();
+    } else if (intent.type === "held_title") {
+      emitText(intent.text);
+      finishStream();
+    } else if (intent.type === "shell" || intent.type === "background_shell") {
+      emitToolCall("bash", { command: intent.command });
+      finishStream();
+    } else if (intent.type === "tool_call") {
+      const name = intent.name.startsWith("mcp__cydo__")
+        ? `cydo_${intent.name.slice("mcp__cydo__".length)}`
+        : intent.name;
+      emitToolCall(name, intent.input);
+      finishStream();
+    } else if (intent.type === "multi_tool_call") {
+      emit({
+        role: "assistant",
+        tool_calls: intent.tool_calls.map((tc) =>
+          chatToolCall(
+            tc.name.startsWith("mcp__cydo__")
+              ? `cydo_${tc.name.slice("mcp__cydo__".length)}`
+              : tc.name,
+            tc.input,
+          ),
+        ),
+      }, "tool_calls");
+      finishStream();
+    } else if (intent.type === "stall") {
+      // Emit a role delta so the stream is well-formed, then never finish.
+      emit({ role: "assistant", content: "" });
+    } else {
+      // Unsupported fixture type for this dialect — answer with plain text so
+      // the turn terminates deterministically instead of hanging.
+      emitText(`Done. (unsupported intent ${intent.type})`);
+      finishStream();
+    }
+  });
+}
+
 const server = createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   console.log(`[mock-api] ${req.method} ${url.pathname}`);
@@ -1424,6 +1567,12 @@ const server = createServer((req, res) => {
   // Responses API (OpenAI / Codex CLI)
   if (url.pathname === "/v1/responses" && req.method === "POST") {
     handleResponses(req, res);
+    return;
+  }
+
+  // Chat Completions API (OpenAI-compatible / Mistral Vibe generic backend)
+  if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
+    handleChatCompletions(req, res);
     return;
   }
 

@@ -6,7 +6,8 @@ import {
   responseTimeout,
 } from "./fixtures";
 
-test("new system prompt is present after keep_context mode switch", async ({
+test("new system prompt is present after keep_context mode switch",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {
@@ -32,7 +33,8 @@ test("new system prompt is present after keep_context mode switch", async ({
   ).toBeVisible({ timeout: responseTimeout(agentType) });
 });
 
-test("old system prompt is absent after keep_context mode switch", { tag: "@no-codex" }, async ({
+test("old system prompt is absent after keep_context mode switch",
+  { tag: ["@no-codex", "@no-vibe"] }, async ({
   page,
   agentType,
 }) => {

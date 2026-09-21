@@ -6,7 +6,7 @@ import {
   responseTimeout,
 } from "./fixtures";
 
-test("system_prompt_template is sent to the LLM API", { tag: "@no-codex" }, async ({
+test("system_prompt_template is sent to the LLM API", { tag: ["@no-codex", "@no-vibe"] }, async ({
   page,
   agentType,
 }) => {

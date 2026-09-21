@@ -7,7 +7,8 @@ import {
   assistantText,
 } from "./fixtures";
 
-test("undo moves user message text to input box", async ({
+test("undo moves user message text to input box",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {

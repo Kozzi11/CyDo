@@ -7,7 +7,7 @@ import { test, expect, enterSession, sendMessage, responseTimeout } from "./fixt
 // it incorrectly rejects AskUserQuestion calls from plan_mode with:
 //   "AskUserQuestion is only available for interactive tasks.
 //    This task type (plan_mode) is not user-visible."
-test("AskUserQuestion works from plan_mode after keep_context mode switch", { tag: "@no-codex" }, async ({
+test("AskUserQuestion works from plan_mode after keep_context mode switch", { tag: ["@no-codex", "@no-vibe"] }, async ({
   page,
   agentType,
 }) => {
@@ -40,7 +40,8 @@ test("AskUserQuestion works from plan_mode after keep_context mode switch", { ta
   await expect(form).toBeVisible({ timeout: responseTimeout(agentType) });
 });
 
-test("ask_user_question clears on all connected clients when one answers", async ({
+test("ask_user_question clears on all connected clients when one answers",
+    { tag: "@no-vibe" }, async ({
   page,
   browser,
   agentType,
@@ -86,7 +87,8 @@ test("ask_user_question clears on all connected clients when one answers", async
   await context2.close();
 });
 
-test("sidebar shows asking status while AskUserQuestion is pending", async ({
+test("sidebar shows asking status while AskUserQuestion is pending",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {

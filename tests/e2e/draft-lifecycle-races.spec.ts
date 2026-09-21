@@ -1248,7 +1248,8 @@ test("post-tid clear and retype waits for the genuine deletion acknowledgement",
   expect(proxy.taskDeleted.filter((tid) => tid === tidA)).toHaveLength(1);
 });
 
-test("submitting during a held empty create delivers one raw message after acknowledgement", async ({
+test("submitting during a held empty create delivers one raw message after acknowledgement",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {

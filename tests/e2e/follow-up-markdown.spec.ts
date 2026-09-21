@@ -5,7 +5,8 @@ import { test, expect, enterSession, sendMessage } from "./fixtures";
 // but sends a message that contains Markdown bold syntax so we can assert that
 // the rendered body contains a <strong> element rather than raw **…** text.
 
-test("Follow-up from parent renders body as Markdown (live and after reload)", async ({
+test("Follow-up from parent renders body as Markdown (live and after reload)",
+    { tag: "@no-vibe" }, async ({
   page,
 }) => {
   await enterSession(page);

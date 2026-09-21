@@ -174,23 +174,37 @@ private struct PermissionRequestParams
 	VibeToolCallRef toolCall;
 }
 
+// Vibe's SDK validates RequestPermissionResponse.outcome as a nested object
+// ({outcome: {outcome: "selected", optionId}}, 2.25.4 pydantic contract), not
+// a flat string.
 private struct PermissionOutcome
 {
-	string outcome = "selected";
-	@JSONOptional string optionId;
+	PermissionOption outcome;
 
 	static PermissionOutcome allowOnce()
 	{
 		PermissionOutcome result;
-		result.optionId = "allow_once";
+		result.outcome = PermissionOption("selected", "allow_once");
 		return result;
 	}
 
 	static PermissionOutcome cancelled()
 	{
 		PermissionOutcome result;
-		result.outcome = "cancelled";
+		result.outcome = PermissionOption("cancelled", null);
 		return result;
+	}
+}
+
+private struct PermissionOption
+{
+	string outcome;
+	@JSONOptional string optionId;
+
+	this(string outcome_, string optionId_)
+	{
+		outcome = outcome_;
+		optionId = optionId_;
 	}
 }
 
@@ -747,9 +761,44 @@ class VibeAgent : Agent
 
 	// ---- History / fork (Part 4: vibe's on-disk session format) ----
 
+	// Vibe persists one LLM message per line under
+	// $VIBE_HOME/logs/session/session_<ts>_<id8>/messages.jsonl (S5-verified).
+	// The directory name embeds the first 8 hex chars of the session UUID;
+	// the timestamp prefix forces a scan rather than a direct join.
 	string historyPath(string sessionId, const ref NativeHistoryProfile profile)
 	{
-		return null;
+		import std.file : dirEntries, exists, SpanMode;
+		import std.path : baseName;
+		import std.algorithm : sort;
+		import std.array : split;
+
+		if (sessionId.length < 8 || profile.root.length == 0)
+			return null;
+		auto sessionsDir = buildPath(profile.root, "logs", "session");
+		if (!sessionsDir.exists)
+			return null;
+		auto prefix = sessionId[0 .. 8];
+		string[string] byPath;
+		try
+			foreach (entry; dirEntries(sessionsDir, "session_*", SpanMode.shallow))
+			{
+				auto name = baseName(entry.name);
+				auto parts = name.split("_");
+				if (parts.length < 4 || parts[3].length < 8)
+					continue;
+				if (parts[3][0 .. 8] != prefix)
+					continue;
+				auto candidate = buildPath(entry.name, "messages.jsonl");
+				if (candidate.exists)
+					byPath[entry.name] = candidate;
+			}
+		catch (Exception)
+			return null;
+		if (byPath.length == 0)
+			return null;
+		// Multiple dirs (fork/compaction chains) — the newest wins.
+		auto names = byPath.keys.sort.release;
+		return byPath[names[$ - 1]];
 	}
 
 	void registerHistoryPath(string sessionId, string path,
@@ -977,12 +1026,16 @@ private McpServerStdio buildCydoMcpServer(int tid, SessionConfig config)
 {
 	import std.array : join;
 
+	// Vibe's SDK validates every env entry as a strict {name, value} string
+	// pair; a JSON null value fails the handshake (2.25.4 pydantic contract),
+	// so optional values are omitted rather than emitted as null.
 	EnvVariable[] env;
 	env ~= EnvVariable("CYDO_TID", to!string(tid));
 	env ~= EnvVariable("CYDO_SOCKET", config.mcpSocketPath);
 	env ~= EnvVariable("CYDO_CREATABLE_TYPES", config.creatableTaskTypes);
 	env ~= EnvVariable("CYDO_SWITCHMODES", config.switchModes);
-	env ~= EnvVariable("CYDO_HANDOFFS", config.handoffs);
+	if (config.handoffs !is null)
+		env ~= EnvVariable("CYDO_HANDOFFS", config.handoffs);
 	env ~= EnvVariable("CYDO_INCLUDE_TOOLS",
 		config.includeTools is null ? "" : config.includeTools.join(","));
 
@@ -2496,6 +2549,17 @@ unittest
 	assert(server.env[4] == EnvVariable("CYDO_HANDOFFS", "handoffs"));
 	assert(server.env[5] == EnvVariable("CYDO_INCLUDE_TOOLS", "Task,Ask"));
 
+	// A null handoffs description is omitted, never serialized as a null
+	// env value — vibe's SDK rejects non-string env values (2.25.4).
+	SessionConfig nullHandoffs = config;
+	nullHandoffs.handoffs = null;
+	auto nullParams = jsonParse!NewSessionProbe(
+		buildNewSessionParams(7, "/test/workdir", nullHandoffs));
+	auto nullServer = nullParams.mcpServers[0];
+	assert(nullServer.env.length == 5);
+	foreach (entry; nullServer.env)
+		assert(entry.name != "CYDO_HANDOFFS");
+
 	// No MCP socket: no servers are delivered via the handshake.
 	config.mcpSocketPath = null;
 	assert(jsonParse!NewSessionProbe(
@@ -3200,13 +3264,15 @@ unittest
 		~ session.sessionId_ ~ `","toolCall":{"toolCallId":"t9"}}}`);
 	drainVibePromiseNextTicks();
 	assert(fixture.connection.sentMessages.length == 1);
-	assert(fixture.connection.sentMessages[0].canFind(`"outcome":"selected"`));
-	assert(fixture.connection.sentMessages[0].canFind(`"optionId":"allow_once"`));
+	// Vibe requires the nested {outcome: {...}} response shape.
+	assert(fixture.connection.sentMessages[0].canFind(
+		`"outcome":{"outcome":"selected","optionId":"allow_once"}}`));
 
 	fixture.connection.receive(`{"jsonrpc":"2.0","id":102,"method":"session/request_permission","params":{"sessionId":"no-such-session","toolCall":{"toolCallId":"t9"}}}`);
 	drainVibePromiseNextTicks();
 	assert(fixture.connection.sentMessages.length == 2);
-	assert(fixture.connection.sentMessages[1].canFind(`"outcome":"cancelled"`));
+	assert(fixture.connection.sentMessages[1].canFind(
+		`"outcome":{"outcome":"cancelled"}}`));
 	assert(!fixture.connection.sentMessages[1].canFind(`"optionId"`));
 
 	fixture.connection.receive(vibeUpdate("no-such-session",
@@ -3214,4 +3280,53 @@ unittest
 	drainVibePromiseNextTicks();
 	assert(emitted.length == 0);
 	assert(fixture.connection.sentMessages.length == 2);
+}
+
+unittest
+{
+	import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir, write;
+	import std.path : buildPath;
+
+	auto root = buildPath(tempDir(), "cydo-vibe-history-path");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+
+	auto agent = new VibeAgent;
+	auto profile = NativeHistoryProfile(AgentDriver.vibe,
+		buildPath(root, "home", ".vibe"));
+
+	// No sessions dir yet: no path.
+	assert(agent.historyPath("abcd1234abcd1234", profile) is null);
+
+	auto sessionsDir = buildPath(profile.root, "logs", "session");
+	mkdirRecurse(buildPath(sessionsDir, "session_20260101_010101_abcd1234"));
+	mkdirRecurse(buildPath(sessionsDir, "session_20260102_020202_abcd1234"));
+	mkdirRecurse(buildPath(sessionsDir, "session_20260103_030303_99999999"));
+
+	// Older dir without the file: not a candidate yet.
+	assert(agent.historyPath("abcd1234abcd1234", profile) is null);
+
+	write(buildPath(sessionsDir, "session_20260101_010101_abcd1234",
+		"messages.jsonl"), "{}\n");
+	auto resolved = agent.historyPath("abcd1234abcd1234", profile);
+	assert(resolved.canFind("session_20260101_010101_abcd1234"),
+		resolved);
+
+	// Newest matching dir wins (fork/compaction chains).
+	write(buildPath(sessionsDir, "session_20260102_020202_abcd1234",
+		"messages.jsonl"), "{}\n");
+	resolved = agent.historyPath("abcd1234abcd1234", profile);
+	assert(resolved.canFind("session_20260102_020202_abcd1234"), resolved);
+
+	// A different session id resolves to its own dir.
+	write(buildPath(sessionsDir, "session_20260103_030303_99999999",
+		"messages.jsonl"), "{}\n");
+	assert(agent.historyPath("99999999eeeeeeee", profile).canFind(
+		"session_20260103_030303_99999999"));
+
+	// Short ids never resolve.
+	assert(agent.historyPath("short", profile) is null);
 }

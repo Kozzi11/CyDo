@@ -456,6 +456,11 @@ class TaskSessionRunner
 		}
 		auto path = (*binding).agent.historyPath((*binding).sessionId,
 			(*binding).profile);
+		// Drivers without live history (e.g. vibe before Part 4 history
+		// parsing lands) return an empty path; treat that as no live watch
+		// rather than rejecting with a non-absolute path error.
+		if (path.length == 0)
+			return LiveHistoryWatchResolution.noLiveBinding();
 		return LiveHistoryWatchResolution.target(LiveHistoryWatchTarget(context, path));
 	}
 

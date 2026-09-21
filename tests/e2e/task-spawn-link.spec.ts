@@ -1,6 +1,7 @@
 import { test, expect, enterSession, sendMessage } from "./fixtures";
 
-test("parent tool-call card shows Open task link to spawned subtask", async ({
+test("parent tool-call card shows Open task link to spawned subtask",
+    { tag: "@no-vibe" }, async ({
   page,
 }) => {
   await enterSession(page);

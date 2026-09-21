@@ -24,17 +24,27 @@ HistoryOperations selectHistoryOperations(AgentDriver driver,
 	CodexForkSourceState codexForkSource)
 {
 	HistoryOperations result;
-	if (driver != AgentDriver.codex)
+	final switch (driver)
 	{
+	case AgentDriver.codex:
+		break;
+	case AgentDriver.claude:
+	case AgentDriver.copilot:
 		result.fork.user = HistoryOperationMechanism.jsonl;
 		result.fork.agent_turn = HistoryOperationMechanism.jsonl;
 		result.undo.user = HistoryOperationMechanism.jsonl;
 		result.undo.agent_turn = HistoryOperationMechanism.jsonl;
 		return result;
+	case AgentDriver.vibe:
+		// No live/persisted history plumbing yet (Part 4): fork and undo
+		// stay unavailable instead of advertising jsonl operations that
+		// cannot resolve a history file.
+		return result;
 	}
-
-	final switch (codexForkSource)
+	switch (codexForkSource)
 	{
+	default:
+		break;
 	case CodexForkSourceState.dead:
 		result.fork.user = HistoryOperationMechanism.codex_native;
 		result.fork.agent_turn = HistoryOperationMechanism.codex_native;

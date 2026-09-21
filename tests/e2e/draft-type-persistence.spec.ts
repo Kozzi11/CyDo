@@ -230,7 +230,8 @@ test("entry point persists across page reload on draft", async ({ page }) => {
   ).toHaveText("blank");
 });
 
-test("sending from isolated draft applies the isolated entry-point prompt", async ({
+test("sending from isolated draft applies the isolated entry-point prompt",
+    { tag: "@no-vibe" }, async ({
   page,
   agentType,
 }) => {

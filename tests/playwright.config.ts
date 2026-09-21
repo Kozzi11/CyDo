@@ -46,6 +46,10 @@ export default defineConfig({
       use: { agentType: "copilot" } as any,
     },
     {
+      name: "vibe",
+      use: { agentType: "vibe" } as any,
+    },
+    {
       name: "failure",
       testDir: "./failure",
       use: { agentType: "claude" } as any,

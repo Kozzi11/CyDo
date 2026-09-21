@@ -1,6 +1,6 @@
 import { test, expect, enterSession, sendMessage, killSession } from "./fixtures";
 
-test("undo removes preceding queue-operation lines from steering message", { tag: "@no-codex" }, async ({ page, agentType }) => {
+test("undo removes preceding queue-operation lines from steering message", { tag: ["@no-codex", "@no-vibe"] }, async ({ page, agentType }) => {
 
   await enterSession(page);
 
