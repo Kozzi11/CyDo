@@ -26,11 +26,7 @@ import {
   assistantText,
 } from "./fixtures";
 
-test("user message appears above assistant response during live session",
-    // Vibe: the submission acceptance arrives with the session/prompt response
-    // (turn END), so the user echo lands after the assistant chunks in the
-    // event stream — deferred until the acceptance ordering is redesigned.
-    { tag: "@no-vibe" }, async ({
+test("user message appears above assistant response during live session", async ({
   page,
   agentType,
 }) => {

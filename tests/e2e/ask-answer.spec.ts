@@ -367,8 +367,7 @@ async function sidebarTids(page: Page): Promise<number[]> {
   );
 }
 
-test("Ask/Answer: follow-up to completed sub-task",
-    { tag: "@no-vibe" }, async ({
+test("Ask/Answer: follow-up to completed sub-task", async ({
   page,
   agentType,
 }) => {
@@ -556,8 +555,7 @@ test("Ask/Answer: follow-up to completed sub-task",
   ).toBeVisible();
 });
 
-test("Ask/Answer: child asks parent, parent answers",
-    { tag: "@no-vibe" }, async ({
+test("Ask/Answer: child asks parent, parent answers", async ({
   page,
   agentType,
 }) => {
@@ -626,7 +624,7 @@ test("Ask/Answer: child asks parent, parent answers",
 });
 
 test("Ask/Answer: parent can answer child question after another Task call",
-    { tag: "@no-vibe" }, async ({
+ async ({
   page,
 }) => {
   const observedTaskResults = observeTaskResultItems(page);
@@ -709,7 +707,7 @@ test("Ask/Answer: parent can answer child question after another Task call",
 });
 
 test("Ask/Answer: completed task result exposes success status and preserved fields",
-    { tag: "@no-vibe" }, async ({
+ async ({
   page,
   agentType,
 }) => {
@@ -754,7 +752,7 @@ test("Ask/Answer: completed task result exposes success status and preserved fie
 });
 
 test("Ask/Answer: task validation errors expose error status and error field",
-    { tag: "@no-vibe" }, async ({
+ async ({
   page,
   agentType,
 }) => {
@@ -781,7 +779,7 @@ test("Ask/Answer: task validation errors expose error status and error field",
 });
 
 test("Ask/Answer: task summaries preserve literal JSON-looking child final text",
-    { tag: "@no-vibe" }, async ({
+ async ({
   page,
   agentType,
 }) => {
@@ -808,7 +806,7 @@ test("Ask/Answer: task summaries preserve literal JSON-looking child final text"
 });
 
 test("Ask/Answer: batch with one completing child and one asking child",
-    { tag: "@no-vibe" }, async ({
+ async ({
   page,
   agentType,
 }) => {
@@ -872,7 +870,7 @@ test("Ask/Answer: batch with one completing child and one asking child",
 });
 
 test("Ask/Answer: same-workspace top-level peer Ask succeeds",
-    { tag: "@no-vibe" }, async ({
+ async ({
   page,
   agentType,
 }) => {
@@ -930,7 +928,7 @@ test("Ask/Answer: same-workspace top-level peer Ask succeeds",
 });
 
 test("Ask/Answer: same-workspace non-direct Ask succeeds",
-    { tag: "@no-vibe" }, async ({
+ async ({
   page,
   agentType,
 }) => {
@@ -1015,7 +1013,7 @@ test("Ask/Answer: same-workspace non-direct Ask succeeds",
 });
 
 test("Ask/Answer: wrong answerer gets Unknown question ID",
-    { tag: "@no-vibe" }, async ({
+ async ({
   page,
   agentType,
 }) => {
@@ -1072,7 +1070,7 @@ test("Ask/Answer: wrong answerer gets Unknown question ID",
 });
 
 test("Ask/Answer: self Ask is rejected",
-    { tag: "@no-vibe" }, async ({ page, agentType }) => {
+ async ({ page, agentType }) => {
   await enterSession(page);
   await sendMessage(page, 'reply with "self-ask-root-ready"');
   await expect(
@@ -1099,7 +1097,7 @@ test("Ask/Answer: self Ask is rejected",
 });
 
 test("Ask/Answer: invalid Ask target returns error",
-    { tag: "@no-vibe" }, async ({
+ async ({
   page,
   agentType,
 }) => {
@@ -1117,8 +1115,7 @@ test("Ask/Answer: invalid Ask target returns error",
   ).toBeVisible();
 });
 
-test("Ask/Answer: tid field present in Task results",
-    { tag: "@no-vibe" }, async ({
+test("Ask/Answer: tid field present in Task results", async ({
   page,
   agentType,
 }) => {
@@ -1154,8 +1151,7 @@ test("Ask/Answer: tid field present in Task results",
   ).toBeVisible();
 });
 
-test("Ask/Answer: two children asking simultaneously are queued",
-    { tag: "@no-vibe" }, async ({
+test("Ask/Answer: two children asking simultaneously are queued", async ({
   page,
   agentType,
 }) => {
@@ -1266,7 +1262,7 @@ test("Ask/Answer: two children asking simultaneously are queued",
 });
 
 test("Ask/Answer: Ask to active sub-task delivers follow-up message",
-    { tag: "@no-vibe" }, async ({
+ async ({
   page,
   agentType,
 }) => {
@@ -1322,7 +1318,7 @@ test("Ask/Answer: Ask to active sub-task delivers follow-up message",
 });
 
 test("Ask/Answer: parent returns to waiting after answering mid-batch",
-    { tag: "@no-vibe" }, async ({
+ async ({
   page,
   agentType,
 }) => {
@@ -1381,7 +1377,11 @@ test("Ask/Answer: parent returns to waiting after answering mid-batch",
 });
 
 test("Ask/Answer: Ask to busy (waiting) sub-task is enqueued",
-    { tag: "@no-vibe" }, async ({
+    // Vibe: the backend wedges at teardown with four concurrent vibe
+    // sessions (SIGTERM escalation → SIGKILL) — needs a shutdown-hang
+    // investigation.
+    { tag: "@no-vibe" },
+ async ({
   page,
   agentType,
 }) => {
@@ -1423,7 +1423,7 @@ test("Ask/Answer: Ask to busy (waiting) sub-task is enqueued",
 });
 
 test("Ask/Answer: Ask to busy sub-task fails if child exits before delivery",
-    { tag: "@no-vibe" }, async ({
+ async ({
   page,
   agentType,
 }) => {
@@ -1472,7 +1472,7 @@ test("Ask/Answer: Ask to busy sub-task fails if child exits before delivery",
 });
 
 test("Ask/Answer: yield enforcement steers parent with unanswered child question",
-    { tag: "@no-vibe" }, async ({
+ async ({
   page,
   agentType,
 }) => {
@@ -1536,7 +1536,10 @@ test("Ask/Answer: yield enforcement steers parent with unanswered child question
 });
 
 test("Ask/Answer: answer delivery is deferred until child becomes idle",
-    { tag: "@no-vibe" }, async ({
+    // Vibe: the deferred answer result does not surface in the asker's
+    // message list yet — needs the busy-delivery flow traced end to end.
+    { tag: "@no-vibe" },
+ async ({
   page,
   agentType,
 }) => {
@@ -1639,7 +1642,7 @@ test(
 );
 
 test("Ask/Answer: Answer with invalid qid returns error",
-    { tag: "@no-vibe" }, async ({
+ async ({
   page,
   agentType,
 }) => {

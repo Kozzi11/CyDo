@@ -456,11 +456,15 @@ class TaskSessionRunner
 		}
 		auto path = (*binding).agent.historyPath((*binding).sessionId,
 			(*binding).profile);
-		// Drivers without live history (e.g. vibe before Part 4 history
-		// parsing lands) return an empty path; treat that as no live watch
-		// rather than rejecting with a non-absolute path error.
+		// A live binding exists but the history path is not resolvable YET —
+		// vibe materializes its session dir only when the first prompt
+		// lands, long after the session id is known. Treat that as
+		// awaiting-path (attach the live context, keep retrying) so the
+		// exit-path reconcile always finds a live context; a genuinely
+		// empty path from a bound driver would make every retry re-scan
+		// harmlessly. Tasks without a binding resolve as noLiveBinding.
 		if (path.length == 0)
-			return LiveHistoryWatchResolution.noLiveBinding();
+			return LiveHistoryWatchResolution.awaitingPath(context);
 		return LiveHistoryWatchResolution.target(LiveHistoryWatchTarget(context, path));
 	}
 

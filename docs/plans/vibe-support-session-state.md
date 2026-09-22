@@ -118,25 +118,42 @@ in 4 spec files.
 2. Also fixed this session (found via the gate):
    - **Vibe tasks persisted status "active" after every turn.** Root
      cause: ae promises defer `.then` handlers (`callSoon` = next tick),
-     and vibe's submission acceptance coincides with the session/prompt
-     *response* (turn END). The deferred acceptance
-     (`commitAcceptedBrowserSubmission` → `setStatus(active)`) ran after
-     the turn-result's active→alive transition and re-activated the idle
-     task. Every backend restart then treated the idle task as mid-turn
-     and sent a restart nudge (spurious extra turn). Fix: the driver
-     fulfills the submission promise, then emits the gated echo + turn
-     result on the *next tick* so the acceptance commits first — the
-     final persisted status is now "alive" (verified end-to-end with an
-     isolated local backend: status trajectory ends alive; the restarted
-     backend logs `status=alive` and takes the no-nudge resume path).
-     This bug existed before the history work; the new history
-     translation merely made the nudge's response visible
-     (resume.spec L231 failed with 2 assistant messages).
-   - session/load replay content (user/agent chunks, tool calls) is now
-     consumed silently — the persisted messages.jsonl is the transcript
-     source of truth, so replaying it after a history load would
-     duplicate every message. The compaction boundary pair is the one
-     replay event still emitted.
+     and vibe's submission acceptance coincided with the session/prompt
+     *response* (turn END). Fix (redesigned after the first attempt):
+     the driver now fulfills the submission promise when the
+     session/prompt REQUEST is written — the same point the other
+     drivers accept (claude's stdin write). Mid-turn the task is
+     "active" as the question router and restart machinery expect;
+     at turn end the turn result idles it with no deferred
+     acceptance to re-activate it. A failed session/prompt response
+     surfaces as process/stderr plus an errored turn/result (the
+     session survives); voided submissions (exit/invalidate) drop
+     their late responses via a submission epoch counter. This also
+     restores the user-message-before-assistant DOM order —
+     history-order L29 is untagged. Verified end-to-end with an
+     isolated local backend: status trajectory ends alive; the
+     restarted backend logs `status=alive` and takes the no-nudge
+     resume path.
+   - **CyDo MCP tool results were invisible to the frontend**: vibe
+     nests the structured payload ({tasks:[...]} for Task,
+     {status, qid, ...} for Ask/Answer) under rawOutput's
+     `structured` field; item/result now unwraps it into
+     `tool_result` (live and history reload paths) so the frontend's
+     subtask-result renderer sees the same shape the other drivers
+     deliver. This unblocked the first ask-answer specs for vibe.
+     Likewise, vibe wraps the real textual outcome (including tool
+     errors like "Unknown question ID") in rawOutput's `text` while
+     the content array only carries a "Ran <Tool>" presentation —
+     extractToolResultText now prefers the wrapper text, which made
+     the four ask-answer error-visibility specs pass.
+   - **Vibe's live history watch never attached when the session dir
+     did not exist at session start** (vibe materializes it on the
+     first prompt): resolveLiveHistoryWatch now returns awaitingPath
+     instead of noLiveBinding for a bound driver with an unresolvable
+     path, so the watch attaches (with retry) and the exit-path
+     reconcile always finds a live context — session-ending L37
+     crashed with "requires an attached live history context" before
+     this.
    - `handleResumeMsg` could not resume a task whose status was already
      "alive" — its `transitionTask` expectedFrom list excludes alive, and
      alive→alive is not a legal transition, so the resume crashed the
@@ -147,6 +164,11 @@ in 4 spec files.
      from the session/new MCP env (pydantic rejects null; the earlier
      fix only covered CYDO_HANDOFFS — a latent bug whenever no task-type
      context exists).
+   - session/load replay content (user/agent chunks, tool calls) is now
+     consumed silently — the persisted messages.jsonl is the transcript
+     source of truth, so replaying it after a history load would
+     duplicate every message. The compaction boundary pair is the one
+     replay event still emitted.
 3. Still deferred:
    - Vibe dialect fixtures for the remaining `@no-vibe`-tagged specs. The
      chat-completions dialect maps text/shell/tool_call/multi_tool_call/
@@ -160,6 +182,13 @@ in 4 spec files.
      redesigned (retagged with a comment).
    - `resume.spec L301` (MCP tools after backend restart): needs the
      task-spawn dialect (retagged with a comment).
+   - ask-answer L1379 ("Ask to busy sub-task is enqueued"): the backend
+     wedges at teardown with four concurrent vibe sessions
+     (SIGTERM→SIGKILL escalation) — shutdown-hang investigation
+     needed (retagged).
+   - ask-answer L1534 ("answer delivery deferred until child becomes
+     idle"): the deferred answer does not surface in the asker's
+     message list yet (retagged).
    - vibe resume-after-kill race investigation with upstream, fork/undo
      for vibe (needs a session-dir + meta.json fork, not just jsonl
      rewriting — see operations.d).

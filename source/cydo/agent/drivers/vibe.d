@@ -1006,6 +1006,7 @@ class VibeAgent : Agent
 				{
 					@JSONOptional string content;
 					@JSONOptional string tool_call_id;
+					@JSONOptional JSONFragment tool_result;
 				}
 				ToolProbe ev;
 				try ev = jsonParse!ToolProbe(line);
@@ -1020,6 +1021,11 @@ class VibeAgent : Agent
 				ItemResultEvent resEv;
 				resEv.item_id = id;
 				resEv.content = JSONFragment(toJson(ev.content));
+				// Keep the structured CyDo payload on the reloaded item like
+				// the live translation does (finalizeTool).
+				auto structuredJson = vibeStructuredPayload(ev.tool_result);
+				if (structuredJson.length > 0)
+					resEv.tool_result = JSONFragment(structuredJson);
 				events ~= TranslatedEvent(toJson(resEv), line);
 				break;
 			}
@@ -1672,6 +1678,11 @@ class VibeSession : AgentSession, VibeSessionHandler
 
 	private bool sessionReady_; // true after session/new|load response
 
+	// Bumped whenever in-flight submissions are voided (exit, invalidate,
+	// failed startup) so their late session/prompt responses are dropped
+	// instead of finalizing turns for a dead lifecycle.
+	private ulong submissionEpoch_;
+
 	// Each message owns its settlement while it waits for readiness, a turn,
 	// or the correlated session/prompt response.
 	private static final class PendingMessage
@@ -1683,6 +1694,7 @@ class VibeSession : AgentSession, VibeSessionHandler
 		Promise!AgentSubmissionReceipt promise;
 		bool settled;
 		bool accepted;
+		ulong epoch; // submissionEpoch_ at submit time; a bump voids it
 		TranslatedEvent gatedUserEcho;
 		bool hasGatedUserEcho;
 
@@ -1788,6 +1800,8 @@ class VibeSession : AgentSession, VibeSessionHandler
 
 	private void removeExpectedUserMessage(PendingMessage submission)
 	{
+		// Soft removal: with acceptance at submit time, the user echo may
+		// have already completed (and consumed) the expected entry.
 		foreach (i, expected; expectedUserMessages)
 			if (expected.submission is submission)
 			{
@@ -1795,7 +1809,6 @@ class VibeSession : AgentSession, VibeSessionHandler
 					~ expectedUserMessages[i + 1 .. $];
 				return;
 			}
-		assert(false, "Vibe submission response has no expected user echo");
 	}
 
 	private void emitAcceptedUserEcho(PendingMessage submission,
@@ -1824,6 +1837,9 @@ class VibeSession : AgentSession, VibeSessionHandler
 
 	private void rejectUnsettledMessages(Exception error)
 	{
+		// Void every in-flight submission: their late session/prompt
+		// responses must be dropped, not finalized.
+		submissionEpoch_++;
 		auto queued = pendingMessages;
 		pendingMessages = null;
 		foreach (submission; queued)
@@ -1876,60 +1892,79 @@ class VibeSession : AgentSession, VibeSessionHandler
 			promptBlock.text = block.text;
 			params.prompt ~= promptBlock;
 		}
+
+		submission.epoch = submissionEpoch_;
+
+		// Acceptance is the request reaching the agent — the same point the
+		// other long-lived drivers accept (claude's stdin write, codex's
+		// turn/start). Vibe's session/prompt response is the TURN BOUNDARY:
+		// committing the acceptance there made the app flip the task active
+		// only after the turn result had idled it (ae promises defer
+		// handlers), and left the task "alive" for the whole turn where the
+		// question router and restart machinery require "active" mid-turn.
+		// It also delayed the user echo until after the assistant chunks.
+		submission.accepted = true;
+		submission.settled = true;
+		submission.promise.fulfill(
+			AgentSubmissionReceipt.appServerAccepted);
 		try
 		{
 			server.sendRequest("session/prompt", toJson(params))
 				.then((JsonRpcResponse response) {
-					if (submission.settled)
-						return;
-					if (response.isError)
-					{
-						removeExpectedUserMessage(submission);
-						resetRejectedSubmission();
-						rejectSubmission(submission,
-							new Exception(response.error.get.message));
-						drainPendingMessages();
-						return;
-					}
-					// The response is both the acceptance and the turn
-					// boundary: finalize streaming state, close the turn,
-					// then release the gated user echo.
-					finalizeActiveTextItem();
-					finalizeAllTools();
-					emitTurnStop();
-					turnInProgress = false;
-					submission.accepted = true;
-					submission.settled = true;
-					submission.promise.fulfill(
-						AgentSubmissionReceipt.appServerAccepted);
-					// The app commits the acceptance on the next tick (ae
-					// promises defer handlers). Vibe's acceptance coincides
-					// with the turn END, so the turn-result events must be
-					// emitted after that commit — otherwise the deferred
-					// acceptance re-activates the task the turn result just
-					// made idle, and the "active" status persists into every
-					// restart (which then nudges the "mid-turn" task).
-					onNextTick(socketManager, {
-						releaseGatedUserEcho(submission);
-						emitTurnResult(response);
-						drainPendingMessages();
-					});
+					finalizeTurn(submission, response);
 				}, (Exception e) {
-					if (submission.settled)
-						return;
-					removeExpectedUserMessage(submission);
-					resetRejectedSubmission();
-					rejectSubmission(submission, e);
-					drainPendingMessages();
+					failTurn(submission, e.msg);
 				}).ignoreResult();
 		}
 		catch (Exception e)
 		{
-			removeExpectedUserMessage(submission);
-			resetRejectedSubmission();
-			rejectSubmission(submission, e);
-			drainPendingMessages();
+			failTurn(submission, e.msg);
 		}
+	}
+
+	/// Close the turn on the session/prompt response.
+	private void finalizeTurn(PendingMessage submission, JsonRpcResponse response)
+	{
+		if (!alive_ || submission.epoch != submissionEpoch_)
+			return;
+		if (response.isError)
+		{
+			failTurn(submission, "session/prompt error: " ~ response.error.get.message);
+			return;
+		}
+		finalizeActiveTextItem();
+		finalizeAllTools();
+		emitTurnStop();
+		turnInProgress = false;
+		releaseGatedUserEcho(submission);
+		emitTurnResult(response);
+		drainPendingMessages();
+	}
+
+	/// A turn that failed after acceptance: the submission is already
+	/// committed, so surface the failure as stderr plus an errored turn
+	/// result — the session itself stays alive for the next turn.
+	private void failTurn(PendingMessage submission, string message)
+	{
+		if (!alive_ || submission.epoch != submissionEpoch_)
+			return;
+		removeExpectedUserMessage(submission);
+		resetRejectedSubmission();
+		ProcessStderrEvent errEv;
+		errEv.text = message;
+		emitEvent(toJson(errEv));
+		emitTurnStop();
+		turnInProgress = false;
+		TurnResultEvent trEv;
+		trEv.subtype        = "error";
+		trEv.is_error       = true;
+		trEv.num_turns      = 1;
+		trEv.duration_ms    = 0;
+		trEv.total_cost_usd = 0.0;
+		trEv.result         = message;
+		trEv.usage          = UsageInfo(0, 0);
+		emitEvent(toJson(trEv));
+		drainPendingMessages();
 	}
 
 	// ----- AgentSession interface -----
@@ -2338,6 +2373,14 @@ class VibeSession : AgentSession, VibeSessionHandler
 			toolResEv.content = JSONFragment(update.content.json); // diff blocks preserved verbatim
 		else
 			toolResEv.content = JSONFragment(toJson(resultText));
+		// CyDo MCP tool results nest the structured payload ({tasks:[...]}
+		// for Task, {status, qid, ...} for Ask/Answer) inside rawOutput's
+		// `structured` field; the frontend renders subtask results and
+		// question statuses from item/result.tool_result, so unwrap it to
+		// the same top-level shape the other drivers deliver.
+		auto structuredJson = vibeStructuredPayload(update.rawOutput);
+		if (structuredJson.length > 0)
+			toolResEv.tool_result = JSONFragment(structuredJson);
 		toolResEv.is_error = failed;
 		emitEvent(toJson(toolResEv), currentRawJson_);
 	}
@@ -2453,11 +2496,64 @@ private string chunkText(JSONFragment content)
 	}
 }
 
+/// Unwrap a CyDo MCP tool's structured payload from vibe's raw result:
+/// vibe nests it under a `structured` field ({tasks:[...]} for Task,
+/// {status, qid, ...} for Ask/Answer). Empty when there is none — callers
+/// leave item/result.tool_result unset so plain tools (bash etc.) keep
+/// their text-only rendering.
+private string vibeStructuredPayload(JSONFragment rawOutput)
+{
+	if (rawOutput.json.length == 0)
+		return "";
+	@JSONPartial static struct Probe
+	{
+		@JSONOptional JSONFragment structured;
+	}
+	try
+	{
+		auto probe = jsonParse!Probe(rawOutput.json);
+		if (probe.structured.json !is null && probe.structured.json.length > 0
+			&& probe.structured.json != "null")
+			return probe.structured.json;
+	}
+	catch (Exception) {}
+	return "";
+}
+
 /// Extract plain text from a completed tool call: the `content` array's
 /// text blocks, falling back to `rawOutput` (plain string, then
 /// content/detailedContent/stdout fields).
 private string extractToolResultText(JSONFragment content, JSONFragment rawOutput)
 {
+	// Vibe wraps CyDo MCP tool outcomes as {ok, server, tool, text,
+	// structured} — the content array only carries a "Ran <Tool>"
+	// presentation, while the real outcome (including tool errors like
+	// "Unknown question ID: ...") rides in `text`. Prefer it whenever the
+	// wrapper shape is present, so errors and textual results render.
+	if (rawOutput.json.length > 0)
+	{
+		@JSONPartial static struct McpOutcomeProbe
+		{
+			@JSONOptional string server;
+			@JSONOptional JSONFragment text;
+		}
+		try
+		{
+			auto probe = jsonParse!McpOutcomeProbe(rawOutput.json);
+			if (probe.server.length > 0 && probe.text.json !is null
+				&& probe.text.json.length > 0 && probe.text.json != "null")
+			{
+				try
+				{
+					auto outcome = jsonParse!string(probe.text.json);
+					if (outcome.length > 0)
+						return outcome;
+				}
+				catch (Exception) {}
+			}
+		}
+		catch (Exception) {}
+	}
 	if (content.json.length > 0)
 	{
 		try
@@ -3102,8 +3198,10 @@ unittest
 unittest
 {
 	// The create owner leaves a production sendMessage promise pending until
-	// session readiness; the session/prompt response is both the acceptance
-	// and the turn boundary, and it releases the gated user echo.
+	// session readiness; acceptance is the prompt request reaching the agent
+	// (the same point claude accepts its stdin write), so the native user
+	// echo streams mid-turn — before the assistant chunks — and the
+	// session/prompt response is purely the turn boundary.
 	auto connection = new TestVibeConnection;
 	auto server = makeTestVibeAcpProcess(connection);
 	auto session = attachSession(server, 1, null, "test-model", "/test/workdir",
@@ -3124,7 +3222,8 @@ unittest
 	connection.respond(newRequest,
 		acceptedVibeResponse(`{"sessionId":"native-vibe-1"}`));
 	drainVibePromiseNextTicks();
-	assertVibePending(submission);
+	// The drain submitted the message; acceptance committed at request time.
+	assertVibeAcceptedOnce(submission);
 	assert(session.sessionReady_ && session.pendingMessages.length == 0
 		&& session.expectedUserMessages.length == 1);
 	assert(emitted.length == 1 && emitted[0].canFind(`"type":"session/init"`));
@@ -3137,24 +3236,29 @@ unittest
 	assert(promptParams.prompt[0].type == "text");
 	assert(promptParams.prompt[0].text == "pre-ready");
 
-	// The native user echo is gated until the session/prompt response accepts
-	// the submission, while agent chunks stream immediately.
+	// The native user echo streams as soon as vibe echoes the full text:
+	// acceptance already committed, there is no gating on the turn boundary.
 	connection.receive(vibeUpdate("native-vibe-1",
 		`{"sessionUpdate":"user_message_chunk","messageId":"um1","content":{"type":"text","text":"pre-"}}`));
 	connection.receive(vibeUpdate("native-vibe-1",
 		`{"sessionUpdate":"user_message_chunk","messageId":"um1","content":{"type":"text","text":"ready"}}`));
-	assert(emitted.length == 0, "gated user echo leaked before acceptance");
+	drainVibePromiseNextTicks();
+	assert(emitted.length == 1, "user echo streams mid-turn");
+	auto echo = jsonParse!ItemStartedEvent(emitted[0]);
+	assert(echo.item_type == "user_message");
+	assert(echo.correlation_id == "pre-ready-nonce");
+	assert(echo.content.length == 1 && echo.content[0].text == "pre-ready");
 
 	connection.receive(vibeUpdate("native-vibe-1",
 		`{"sessionUpdate":"agent_message_chunk","messageId":"am1","content":{"type":"text","text":"hi there"}}`));
-	assert(emitted.length == 2);
+	assert(emitted.length == 3);
 	emitted = null;
 
 	connection.respond(promptRequest, acceptedVibeResponse(
 		`{"stopReason":"end_turn","usage":{"input_tokens":11,"output_tokens":7}}`));
 	drainVibePromiseNextTicks();
 	assertVibeAcceptedOnce(submission);
-	assert(emitted.length == 4);
+	assert(emitted.length == 3);
 	assert(emitted[0].canFind(`"type":"item/completed"`));
 	assert(emitted[0].canFind(`"text":"hi there"`));
 	assert(emitted[1].canFind(`"type":"turn/stop"`));
@@ -3162,16 +3266,14 @@ unittest
 	assert(emitted[2].canFind(`"input_tokens":11`));
 	assert(emitted[2].canFind(`"output_tokens":7`));
 	assert(emitted[2].canFind(`"result":"hi there"`));
-	auto echo = jsonParse!ItemStartedEvent(emitted[3]);
-	assert(echo.item_type == "user_message");
-	assert(echo.correlation_id == "pre-ready-nonce");
-	assert(echo.content.length == 1 && echo.content[0].text == "pre-ready");
 }
 
 unittest
 {
-	// A rejected session/prompt restores the idle state, rejects only its own
-	// record, and immediately submits the queued successor with a distinct ID.
+	// A failed session/prompt turn surfaces as stderr plus an errored turn
+	// result (acceptance already committed at request time), restores the
+	// idle state, and immediately submits the queued successor with a
+	// distinct request id.
 	auto fixture = makeReadyVibeSession(2);
 	auto session = fixture.session;
 	string[] emitted;
@@ -3181,23 +3283,33 @@ unittest
 
 	auto rejected = new TestVibeSubmissionOutcome(
 		session.sendMessage([ContentBlock("text", "reject me")], "reject"));
+	drainVibePromiseNextTicks();
+	assertVibeAcceptedOnce(rejected);
 	auto rejectedRequest = fixture.connection.takeRequest("session/prompt");
 	auto successor = new TestVibeSubmissionOutcome(
 		session.sendMessage([ContentBlock("text", "accept me")], "successor"));
-	assertVibePending(rejected);
 	assertVibePending(successor);
 	assert(session.pendingMessages.length == 1);
 
 	fixture.connection.respond(rejectedRequest,
 		rejectedVibeResponse("prompt rejected"));
 	drainVibePromiseNextTicks();
-	assertVibeRejectedOnce(rejected, "prompt rejected");
-	assertVibePending(successor);
+	assertVibeAcceptedOnce(rejected);
+	// The failed turn's drain submitted the successor; it was accepted at
+	// its own request time.
+	assertVibeAcceptedOnce(successor);
 	assert(session.pendingMessages.length == 0
 		&& session.expectedUserMessages.length == 1
 		&& session.turnInProgress);
-	assert(emitted.length == 0,
-		"session/prompt rejection fabricated a translated event");
+	assert(emitted.length == 3,
+		"the failed turn surfaces as stderr, stop and errored result: "
+			~ to!string(emitted.length));
+	assert(emitted[0].canFind(`"type":"process/stderr"`));
+	assert(emitted[0].canFind("session/prompt error: prompt rejected"));
+	assert(emitted[1].canFind(`"type":"turn/stop"`));
+	assert(emitted[2].canFind(`"type":"turn/result"`));
+	assert(emitted[2].canFind(`"subtype":"error"`));
+	assert(emitted[2].canFind(`"is_error":true`));
 
 	auto successorRequest = fixture.connection.takeRequest("session/prompt");
 	auto successorParams = jsonParse!PromptParams(
@@ -3210,12 +3322,12 @@ unittest
 	fixture.connection.respond(successorRequest, acceptedVibeResponse(
 		`{"stopReason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`));
 	drainVibePromiseNextTicks();
-	assertVibeRejectedOnce(rejected, "prompt rejected");
 	assertVibeAcceptedOnce(successor);
-	assert(emitted.length == 2,
+	assert(emitted.length == 5,
 		"the session/prompt response is the vibe turn boundary");
-	assert(emitted[0].canFind(`"type":"turn/stop"`));
-	assert(emitted[1].canFind(`"type":"turn/result"`));
+	assert(emitted[3].canFind(`"type":"turn/stop"`));
+	assert(emitted[4].canFind(`"type":"turn/result"`));
+	assert(emitted[4].canFind(`"subtype":"success"`));
 }
 
 unittest
@@ -3239,7 +3351,9 @@ unittest
 		loseLifecycle(session);
 		loseLifecycle(session);
 		drainVibePromiseNextTicks();
-		assertVibeRejectedOnce(inFlight);
+		// The in-flight submission was accepted at request time; the queued
+		// one was never submitted and rejects.
+		assertVibeAcceptedOnce(inFlight);
 		assertVibeRejectedOnce(queued);
 		assert(session.alive_ == remainsAlive);
 		assert(session.expectedUserMessages.length == 0
@@ -3248,7 +3362,7 @@ unittest
 		fixture.connection.respond(captured,
 			acceptedVibeResponse(`{"stopReason":"end_turn"}`));
 		drainVibePromiseNextTicks();
-		assertVibeRejectedOnce(inFlight);
+		assertVibeAcceptedOnce(inFlight);
 		assertVibeRejectedOnce(queued);
 		assert(session.expectedUserMessages.length == 0
 			&& session.pendingMessages.length == 0);
@@ -3293,7 +3407,9 @@ unittest
 		assert(cancelParams.sessionId == "close-" ~ label);
 		assert(fixture.connection.sentMessages.length == 0);
 		drainVibePromiseNextTicks();
-		assertVibeRejectedOnce(inFlight);
+		// The in-flight submission was accepted at request time — the exit
+		// does not withdraw it; the queued one rejects.
+		assertVibeAcceptedOnce(inFlight);
 		assertVibeRejectedOnce(queued);
 		assert(exitStatuses == [expectedExitStatus]);
 		assert(fixture.server.dead && !session.alive);
@@ -3301,7 +3417,7 @@ unittest
 		fixture.connection.respond(captured,
 			acceptedVibeResponse(`{"stopReason":"end_turn"}`));
 		drainVibePromiseNextTicks();
-		assertVibeRejectedOnce(inFlight);
+		assertVibeAcceptedOnce(inFlight);
 		assertVibeRejectedOnce(queued);
 		assert(fixture.connection.sentMessages.length == 0);
 	}
@@ -4097,4 +4213,64 @@ unittest
 		"session/set_config_option error: Invalid thinking value");
 	assert(!session.alive_ && !session.sessionReady_);
 	assert(emitted.length == 0);
+}
+
+unittest
+{
+	// CyDo MCP tool results nest the structured payload under rawOutput's
+	// `structured` field; item/result unwraps it so the frontend's cydo
+	// tool-result renderer sees the same shape the other drivers deliver.
+	import std.algorithm : filter;
+	import std.array : array;
+
+	assert(vibeStructuredPayload(JSONFragment(
+			`{"ok":true,"tool":"Task","structured":{"tasks":[{"summary":"child-done","tid":2,"status":"success"}]}}`))
+		== `{"tasks":[{"summary":"child-done","tid":2,"status":"success"}]}`,
+		"structured payload is unwrapped to its top-level shape");
+	assert(vibeStructuredPayload(JSONFragment(`{"output":{"exit_code":0}}`)) == "",
+		"plain tool output has no structured payload");
+	assert(vibeStructuredPayload(JSONFragment(`{"structured":null}`)) == "");
+	assert(vibeStructuredPayload(JSONFragment(`not json`)) == "");
+	assert(vibeStructuredPayload(JSONFragment("")) == "");
+
+	// The live tool lifecycle attaches it to item/result.
+	auto fixture = makeReadyVibeSession(15);
+	auto session = fixture.session;
+	auto sid = session.sessionId_;
+	string[] emitted;
+	session.onOutput = (TranslatedEvent event) {
+		emitted ~= event.translated;
+	};
+	auto submission = new TestVibeSubmissionOutcome(
+		session.sendMessage([ContentBlock("text", "call task research")], "task-nonce"));
+	auto promptRequest = fixture.connection.takeRequest("session/prompt");
+	fixture.connection.receive(vibeUpdate(sid,
+		`{"sessionUpdate":"tool_call","toolCallId":"t-task","rawInput":{"tasks":[]},"_meta":{"tool_name":"cydo_Task"}}`));
+	fixture.connection.receive(vibeUpdate(sid,
+		`{"sessionUpdate":"tool_call_update","toolCallId":"t-task","status":"completed","content":[{"type":"content","content":{"type":"text","text":"Ran Task"}}],"rawOutput":{"ok":true,"tool":"Task","structured":{"tasks":[{"summary":"child-done","tid":2,"status":"success"}]}}}`));
+	auto result = emitted
+		.filter!(e => e.canFind(`"type":"item/result"`))
+		.array[0];
+	assert(result.canFind(`"tool_result":{"tasks":[{"summary":"child-done","tid":2,"status":"success"}]}`),
+		result);
+	// Plain tools keep their text-only item/result (no tool_result field).
+	fixture.connection.receive(vibeUpdate(sid,
+		`{"sessionUpdate":"tool_call","toolCallId":"t-bash","rawInput":{"command":"ls"},"_meta":{"tool_name":"bash"}}`));
+	fixture.connection.receive(vibeUpdate(sid,
+		`{"sessionUpdate":"tool_call_update","toolCallId":"t-bash","status":"completed","rawOutput":{"output":{"exit_code":0,"stdout":"file"}}}`));
+	auto plainResult = emitted
+		.filter!(e => e.canFind(`"item_id":"vb-tool-t-bash"`) && e.canFind(`"type":"item/result"`))
+		.array[0];
+	assert(!plainResult.canFind(`"tool_result"`), plainResult);
+
+	// Persisted history: the tool line's nested tool_result is unwrapped on
+	// reload the same way.
+	auto agent = new VibeAgent;
+	auto reloaded = agent.translateHistoryLine(
+		`{"role": "tool", "content": "Ran Task", "injected": false, "name": "cydo_Task", "tool_call_id": "call_t", "tool_result": {"ok": true, "tool": "Task", "structured": {"tasks": [{"summary": "child-done", "tid": 2, "status": "success"}]}}}`, 21);
+	assert(reloaded.length == 2);
+	auto resEv = jsonParse!ItemResultEvent(reloaded[1].translated);
+	assert(resEv.item_id == "vb-tool-call_t");
+	assert(resEv.tool_result.json.canFind(`"tasks"`));
+	assert(jsonParse!string(resEv.content.json) == "Ran Task");
 }
