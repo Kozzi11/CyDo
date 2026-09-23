@@ -354,6 +354,7 @@ class App
 				loadTemplateText: &loadTemplateText,
 			));
 		workflowTools = new WorkflowToolsBackend(WorkflowToolsHost(
+			shuttingDown: () => shuttingDown,
 			getTask: (int tid) => tid in tasks ? &tasks[tid] : null,
 			createTask: (string workspace, string projectPath, string agentName) {
 				return createTask(workspace, projectPath, agentName);

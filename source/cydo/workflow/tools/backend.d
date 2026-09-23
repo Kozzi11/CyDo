@@ -94,6 +94,9 @@ struct WorkflowToolsHost
 	bool delegate(int tid, out string sessionState) canSendSystemMessage;
 	Promise!void delegate(int tid, KnownSystemMessageKind kind, string body)
 		sendKnownSystemMessage;
+	/// Null on hosts that never shut down (unittest fixtures); consumers
+	/// treat null as "not shutting down".
+	bool delegate() shuttingDown = null;
 
 	void delegate(int parentTid, int childTid) persistAddTaskDep;
 	void delegate(int parentTid, int childTid) persistRemoveTaskDep;
@@ -292,6 +295,7 @@ public:
 				removeTaskDependency: &removeTaskDependency,
 				taskAlive: host_.taskAlive,
 				onNextTick: host_.onNextTick,
+				shuttingDown: host_.shuttingDown,
 				appendAndBroadcastRecoveryDeliveryDiagnostic:
 					host_.appendAndBroadcastRecoveryDeliveryDiagnostic,
 			));

@@ -44,6 +44,9 @@ struct SubtaskResultDeliveryHost
 	void delegate(void delegate() cb) onNextTick;
 	void delegate(int tid, string subject, string body)
 		appendAndBroadcastRecoveryDeliveryDiagnostic;
+	/// Null on hosts that never shut down (unittest fixtures); consumers
+	/// treat null as "not shutting down".
+	bool delegate() shuttingDown = null;
 }
 
 class SubtaskResultDelivery
@@ -162,14 +165,14 @@ public:
 		return deliverBatchResults(parentTid);
 	}
 
-	Promise!void deliverBatchResults(int parentTid)
+	Promise!void deliverBatchResults(int parentTid, bool retried = false)
 	{
 		if (host_.getTask(parentTid) is null)
 			return resolve();
 
 		try
 			return host_.ensureProcessQueueAlive(parentTid).then(() {
-				return actuallyDeliverBatchResults(parentTid);
+				return actuallyDeliverBatchResults(parentTid, retried);
 			});
 		catch (Exception e)
 			return reject!void(e);
@@ -271,7 +274,7 @@ private:
 		return result;
 	}
 
-	Promise!void actuallyDeliverBatchResults(int parentTid)
+	Promise!void actuallyDeliverBatchResults(int parentTid, bool retried = false)
 	{
 		import ae.utils.json : toJson;
 
@@ -284,9 +287,28 @@ private:
 		string sessionState;
 		if (!host_.canSendSystemMessage(parentTid, sessionState))
 		{
+			// The retry below re-enters deliverBatchResults via a next-tick
+			// requeue, so an unbounded loop here spins the event loop hot
+			// (observed: millions of retries per minute when the parent's
+			// session was cancelled at backend shutdown, wedging the
+			// process until SIGKILL). Give up once the shutdown has begun,
+			// and after one resume attempt failed to produce a sendable
+			// session.
+			if (host_.shuttingDown !is null && host_.shuttingDown())
+			{
+				tracef("actuallyDeliverBatchResults: parent tid=%d session %s, shutting down, giving up",
+					parentTid, sessionState);
+				return resolve();
+			}
+			if (retried)
+			{
+				warningf("actuallyDeliverBatchResults: parent tid=%d session %s after resume, giving up",
+					parentTid, sessionState);
+				return resolve();
+			}
 			warningf("actuallyDeliverBatchResults: parent tid=%d session %s, retrying via deliverBatchResults",
 				parentTid, sessionState);
-			return deliverBatchResults(parentTid);
+			return deliverBatchResults(parentTid, true);
 		}
 
 		auto children = host_.childTaskIds(parentTid);

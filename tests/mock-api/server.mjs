@@ -1421,6 +1421,48 @@ function chatToolCall(name, input) {
   };
 }
 
+/// Vibe's generic chat client cannot accumulate parallel tool calls with
+/// different names in one assistant message ("Can't accumulate messages
+/// with different tool call names", 2.25.4), so the chat dialect decomposes
+/// multi_tool_call fixtures: only the first call is emitted, and each tool
+/// result advances to the next call. Given the request messages, return the
+/// next un-executed call of the originating multi_tool_call fixture, or
+/// null when the fixture is finished or the turn had a single tool call.
+function nextPendingToolCall(messages) {
+  // The turn-opening user message is the last user message with string
+  // content; re-matching it recovers the fixture's full call list.
+  let userIndex = -1;
+  let userText = null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user" && typeof messages[i].content === "string") {
+      userIndex = i;
+      userText = messages[i].content;
+      break;
+    }
+  }
+  if (userIndex < 0 || userText === null)
+    return null;
+  const intent = matchPattern(userText);
+  if (intent === null || intent.type !== "multi_tool_call")
+    return null;
+  // Count the tool results that arrived within this turn.
+  let results = 0;
+  for (let i = userIndex + 1; i < messages.length; i++)
+    if (messages[i].role === "tool")
+      results++;
+  if (results >= intent.tool_calls.length)
+    return null;
+  const next = intent.tool_calls[results];
+  if (!next)
+    return null;
+  return {
+    name: next.name.startsWith("mcp__cydo__")
+      ? `cydo_${next.name.slice("mcp__cydo__".length)}`
+      : next.name,
+    input: next.input,
+  };
+}
+
 function handleChatCompletions(req, res) {
   let body = "";
   req.on("data", (chunk) => (body += chunk));
@@ -1490,10 +1532,15 @@ function handleChatCompletions(req, res) {
       res.end();
     };
 
-    // After a tool result, acknowledge so the turn can complete. Multi-step
-    // fixtures are out of scope for the vibe project; every other driver
-    // covers them.
+    // After a tool result, either advance a decomposed multi-tool fixture
+    // to its next call or acknowledge so the turn can complete.
     if (isToolResult) {
+      const nextCall = nextPendingToolCall(messages);
+      if (nextCall) {
+        emitToolCall(nextCall.name, nextCall.input);
+        finishStream();
+        return;
+      }
       emitText("Done.");
       finishStream();
       return;
@@ -1523,17 +1570,16 @@ function handleChatCompletions(req, res) {
       emitToolCall(name, intent.input);
       finishStream();
     } else if (intent.type === "multi_tool_call") {
-      emit({
-        role: "assistant",
-        tool_calls: intent.tool_calls.map((tc) =>
-          chatToolCall(
-            tc.name.startsWith("mcp__cydo__")
-              ? `cydo_${tc.name.slice("mcp__cydo__".length)}`
-              : tc.name,
-            tc.input,
-          ),
-        ),
-      }, "tool_calls");
+      // Vibe's chat client rejects parallel tool calls with different
+      // names in one message — emit only the first; each tool result
+      // advances to the next call (see nextPendingToolCall).
+      const first = intent.tool_calls[0];
+      emitToolCall(
+        first.name.startsWith("mcp__cydo__")
+          ? `cydo_${first.name.slice("mcp__cydo__".length)}`
+          : first.name,
+        first.input,
+      );
       finishStream();
     } else if (intent.type === "stall") {
       // Emit a role delta so the stream is well-formed, then never finish.

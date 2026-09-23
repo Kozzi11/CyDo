@@ -154,6 +154,23 @@ in 4 spec files.
      reconcile always finds a live context — session-ending L37
      crashed with "requires an attached live history context" before
      this.
+   - **Batch-result delivery could hot-spin the event loop forever.**
+     `actuallyDeliverBatchResults` re-entered `deliverBatchResults` via a
+     next-tick requeue whenever the parent's session was not sendable —
+     with no shutdown check, no cap and no delay. At backend shutdown
+     (four concurrent vibe sessions, parent cancelled) this spun
+     millions of retries per minute and wedged the process until
+     SIGKILL (ask-answer L1379). The delivery now gives up once the
+     shutdown has begun (new `shuttingDown` hook on the delivery host)
+     and after one failed resume attempt.
+   - **Vibe's chat client rejects parallel tool calls with different
+     names in one assistant message** ("Can't accumulate messages with
+     different tool call names", 2.25.4). The mock's chat dialect now
+     decomposes multi_tool_call fixtures: only the first call is
+     emitted, and each tool result advances to the next call
+     (`nextPendingToolCall` re-matches the turn-opening user text).
+     This made the deferred-answer spec pass (ask-answer L1534) and the
+     whole ask-answer spec now runs for vibe.
    - `handleResumeMsg` could not resume a task whose status was already
      "alive" — its `transitionTask` expectedFrom list excludes alive, and
      alive→alive is not a legal transition, so the resume crashed the
@@ -182,13 +199,10 @@ in 4 spec files.
      redesigned (retagged with a comment).
    - `resume.spec L301` (MCP tools after backend restart): needs the
      task-spawn dialect (retagged with a comment).
-   - ask-answer L1379 ("Ask to busy sub-task is enqueued"): the backend
-     wedges at teardown with four concurrent vibe sessions
-     (SIGTERM→SIGKILL escalation) — shutdown-hang investigation
-     needed (retagged).
    - ask-answer L1534 ("answer delivery deferred until child becomes
-     idle"): the deferred answer does not surface in the asker's
-     message list yet (retagged).
+     idle"): FIXED — the mock's chat dialect now decomposes
+     multi_tool_call fixtures for vibe (see above); the spec is
+     untagged and the whole ask-answer file runs for vibe.
    - vibe resume-after-kill race investigation with upstream, fork/undo
      for vibe (needs a session-dir + meta.json fork, not just jsonl
      rewriting — see operations.d).

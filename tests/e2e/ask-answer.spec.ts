@@ -1377,10 +1377,6 @@ test("Ask/Answer: parent returns to waiting after answering mid-batch",
 });
 
 test("Ask/Answer: Ask to busy (waiting) sub-task is enqueued",
-    // Vibe: the backend wedges at teardown with four concurrent vibe
-    // sessions (SIGTERM escalation → SIGKILL) — needs a shutdown-hang
-    // investigation.
-    { tag: "@no-vibe" },
  async ({
   page,
   agentType,
@@ -1536,9 +1532,6 @@ test("Ask/Answer: yield enforcement steers parent with unanswered child question
 });
 
 test("Ask/Answer: answer delivery is deferred until child becomes idle",
-    // Vibe: the deferred answer result does not surface in the asker's
-    // message list yet — needs the busy-delivery flow traced end to end.
-    { tag: "@no-vibe" },
  async ({
   page,
   agentType,
