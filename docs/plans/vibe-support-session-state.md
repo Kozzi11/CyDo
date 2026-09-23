@@ -107,6 +107,14 @@ in 4 spec files.
   `rm result` if in the way.
 
 ## Next steps (in order)
+0. Done this session: **bumped mistral-vibe to v2.25.7** (flake.nix
+   hashes for all four assets). Release-notes review: 2.25.7 is
+   teleport/config/UI fixes; 2.25.5 (skipped) switched the default to
+   the Unified Harness and made MCP tool calls go through the
+   permission system by default — both re-verified green: all 117
+   vibe e2e checks pass against 2.25.7 (the driver's auto-approve
+   handles any new cydo_* permission requests). Driver comments now
+   cite the verified range 2.25.4–2.25.7.
 1. Done this session (afternoon): Part 4 history parsing —
    `translateHistoryLine` (persisted LLM-message lines → agnostic items,
    turn synthesis), `extractPersistedHistoryBoundaries` (message_id

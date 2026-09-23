@@ -193,25 +193,25 @@ EOF
           # releases. Two binaries ship from the same release: `vibe-acp`
           # (the ACP server used for sessions) and `vibe` (the one-shot CLI);
           # both read the same config.
-          vibeVersion = "2.25.4";
+          vibeVersion = "2.25.7";
           vibeAcpSrc = {
             x86_64-linux = {
               url = "https://github.com/mistralai/mistral-vibe/releases/download/v${vibeVersion}/vibe-acp-linux-x86_64-${vibeVersion}.tar.gz";
-              hash = "sha256-nX5aAZTBogMK+OtJQdGulPAK4x0kGxWfNEtbOFtWQP0=";
+              hash = "sha256-kS1MMGhSn/R3PDvKiSaO1AHatfD5BigQDriOsNGgsYk=";
             };
             aarch64-linux = {
               url = "https://github.com/mistralai/mistral-vibe/releases/download/v${vibeVersion}/vibe-acp-linux-aarch64-${vibeVersion}.tar.gz";
-              hash = "sha256-ZjfO+4J8/2MnEEE/B4Ij1DzlGNPiNHONAyOPv+A104g=";
+              hash = "sha256-js736Lz8O6ONYtDmQR5A5QyBN/ecFh/Epb7y1LZdVN4=";
             };
           }.${system} or (throw "Mistral Vibe: unsupported system ${system}");
           vibeCliSrc = {
             x86_64-linux = {
               url = "https://github.com/mistralai/mistral-vibe/releases/download/v${vibeVersion}/vibe-linux-x86_64-${vibeVersion}.zip";
-              hash = "sha256-5as05ULwM1J6IYt0YhFLLa4QDqXuCoePLgFcReHy84s=";
+              hash = "sha256-1dwjMmW3sDuumzSoZ0QYpo7Av73aRgqLmA6eD2mjKnc=";
             };
             aarch64-linux = {
               url = "https://github.com/mistralai/mistral-vibe/releases/download/v${vibeVersion}/vibe-linux-aarch64-${vibeVersion}.zip";
-              hash = "sha256-vypCQI/2iMWVT5Apl3eLVH2XUXSh8ziWrIG6Z63y4Yo=";
+              hash = "sha256-LlzTvLkar6ggpQRGcTruSAUC1ar3t8cTJyVNM7NmY1E=";
             };
           }.${system} or (throw "Mistral Vibe: unsupported system ${system}");
 

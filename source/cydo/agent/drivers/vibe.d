@@ -41,7 +41,7 @@ import cydo.runtime.launch.types : NativeHistoryProfile, NativeHistoryRule,
 private alias SO = SerializedObject!(immutable char);
 
 // ---------------------------------------------------------------------------
-// ACP wire structs — protocol v1, verified against vibe-acp 2.25.4
+// ACP wire structs — protocol v1, verified against vibe-acp 2.25.4–2.25.7
 // (see docs/research/vibe-acp-wire.md and docs/research/acp/SPEC_v1.md).
 // ---------------------------------------------------------------------------
 
@@ -216,7 +216,7 @@ private struct PermissionRequestParams
 }
 
 // Vibe's SDK validates RequestPermissionResponse.outcome as a nested object
-// ({outcome: {outcome: "selected", optionId}}, 2.25.4 pydantic contract), not
+// ({outcome: {outcome: "selected", optionId}}, 2.25.4–2.25.7 pydantic contract), not
 // a flat string.
 private struct PermissionOutcome
 {
@@ -1336,7 +1336,7 @@ class VibeAgent : Agent
 
 		auto spec = resolveModelSpec(modelClass);
 		// The CLI has no --model flag; VIBE_ACTIVE_MODEL overrides any config
-		// field (verified against vibe 2.25.4). An empty alias leaves it unset
+		// field (verified against vibe 2.25.4–2.25.7). An empty alias leaves it unset
 		// so vibe uses its own configured default.
 		if (spec.model.length > 0)
 			env["VIBE_ACTIVE_MODEL"] = spec.model;
@@ -1423,7 +1423,7 @@ private McpServerStdio buildCydoMcpServer(int tid, SessionConfig config)
 	import std.array : join;
 
 	// Vibe's SDK validates every env entry as a strict {name, value} string
-	// pair; a JSON null value fails the handshake (2.25.4 pydantic contract),
+	// pair; a JSON null value fails the handshake (2.25.4–2.25.7 pydantic contract),
 	// so optional values are omitted rather than emitted as null.
 	EnvVariable[] env;
 	env ~= EnvVariable("CYDO_TID", to!string(tid));
@@ -3115,7 +3115,7 @@ unittest
 	assert(server.env[5] == EnvVariable("CYDO_INCLUDE_TOOLS", "Task,Ask"));
 
 	// A null handoffs description is omitted, never serialized as a null
-	// env value — vibe's SDK rejects non-string env values (2.25.4).
+	// env value — vibe's SDK rejects non-string env values (2.25.4–2.25.7).
 	SessionConfig nullHandoffs = config;
 	nullHandoffs.handoffs = null;
 	auto nullParams = jsonParse!NewSessionProbe(
