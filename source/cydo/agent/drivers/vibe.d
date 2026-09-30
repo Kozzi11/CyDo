@@ -854,11 +854,83 @@ class VibeAgent : Agent
 	string createHistoryForkDestination(string sessionId, string sourceHistoryPath,
 		const ref NativeHistoryProfile profile)
 	{
-		// Fork stays unavailable (selectHistoryOperations): the jsonl fork
-		// machinery rewrites only messages.jsonl, while a resumable vibe fork
-		// additionally needs a new session dir with a meta.json carrying the
-		// forked session_id.
-		return null;
+		import std.datetime : Clock;
+		import std.file : exists, mkdirRecurse, readText, write;
+		import std.format : format;
+		import std.path : dirName;
+		import std.string : lineSplitter;
+
+		enforce(profile.driver == driver,
+			"Vibe history fork requires the Mistral Vibe history profile");
+		enforce(sessionId.length >= 8,
+			"Vibe history fork requires an 8+ char session ID");
+
+		// A resumable fork needs its own session dir whose meta.json carries
+		// the forked session_id — messages.jsonl alone is not loadable.
+		// Dir name mirrors vibe's own layout: session_<ts>_<first 8 of id>.
+		auto sessionsDir = buildPath(profile.root, "logs", "session");
+		auto sourceDir = dirName(sourceHistoryPath);
+		auto sourceMetaPath = buildPath(sourceDir, "meta.json");
+		auto sourceMeta = readVibeMetaFile(sourceMetaPath);
+
+		auto now = Clock.currTime;
+		auto id8 = sessionId[0 .. 8];
+		auto newDir = buildPath(sessionsDir,
+			format!"session_%04d%02d%02d_%02d%02d%02d_%s"(now.year,
+				cast(int) now.month, now.day, now.hour, now.minute, now.second,
+				id8));
+		mkdirRecurse(newDir);
+
+		// vibe's SessionMetadata (pydantic) requires session_id, start_time,
+		// end_time, git_commit, git_branch, environment, username; the loader
+		// additionally keys total_messages. Verified against 2.25.7: a
+		// synthesized dir with this shape resumes via session/load, and a
+		// wrong total_messages is tolerated (metadata only, not validated
+		// against the transcript).
+		string username = "cydo";
+		long totalMessages = 0;
+		if (exists(sourceMetaPath))
+		{
+			import std.json : JSONType, parseJSON;
+			try
+			{
+				auto source = parseJSON(readText(sourceMetaPath));
+				if (source.type == JSONType.object
+					&& "username" in source.object
+					&& source.object["username"].type == JSONType.string)
+					username = source.object["username"].str;
+			}
+			catch (Exception) {}
+		}
+		if (exists(sourceHistoryPath))
+			foreach (line; readText(sourceHistoryPath).lineSplitter)
+				if (line.length > 0)
+					totalMessages++;
+
+		auto originDirectory = sourceMeta.originDirectory.length > 0
+			? sourceMeta.originDirectory : sourceDir;
+		auto timestamp = format!"%04d-%02d-%02dT%02d:%02d:%02d.000000+00:00"(
+			now.year, cast(int) now.month, now.day, now.hour, now.minute,
+			now.second);
+		auto meta = "{\n"
+			~ "  \"session_id\": " ~ toJson(sessionId) ~ ",\n"
+			~ "  \"parent_session_id\": null,\n"
+			~ "  \"start_time\": " ~ toJson(timestamp) ~ ",\n"
+			~ "  \"end_time\": " ~ toJson(timestamp) ~ ",\n"
+			~ "  \"git_commit\": null,\n"
+			~ "  \"git_branch\": null,\n"
+			~ "  \"environment\": {\"working_directory\": "
+				~ toJson(originDirectory) ~ "},\n"
+			~ "  \"origin_directory\": " ~ toJson(originDirectory) ~ ",\n"
+			~ "  \"username\": " ~ toJson(username) ~ ",\n"
+			~ "  \"child_sessions\": [],\n"
+			~ "  \"loops\": [],\n"
+			~ "  \"title\": null,\n"
+			~ "  \"title_source\": \"auto\",\n"
+			~ "  \"total_messages\": " ~ to!string(totalMessages) ~ "\n"
+			~ "}";
+		write(buildPath(newDir, "meta.json"), meta);
+		return buildPath(newDir, "messages.jsonl");
 	}
 
 	void resetHistoryReplay()
@@ -4273,4 +4345,55 @@ unittest
 	assert(resEv.item_id == "vb-tool-call_t");
 	assert(resEv.tool_result.json.canFind(`"tasks"`));
 	assert(jsonParse!string(resEv.content.json) == "Ran Task");
+}
+
+unittest
+{
+	// createHistoryForkDestination: a fork gets its own session dir with a
+	// meta.json carrying the forked session_id — the shape vibe's session/load
+	// validates (required fields verified against 2.25.7).
+	import std.algorithm : canFind;
+	import std.file : exists, mkdirRecurse, readText, rmdirRecurse, tempDir, write;
+	import std.path : baseName, buildPath, dirName;
+
+	auto root = buildPath(tempDir(), "cydo-vibe-fork-dest");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+
+	auto sessionsDir = buildPath(root, "logs", "session");
+	auto sourceDir = buildPath(sessionsDir, "session_20260101_010101_aaaa1111");
+	mkdirRecurse(sourceDir);
+	write(buildPath(sourceDir, "meta.json"),
+		`{"session_id": "aaaa1111-2222-3333-4444-555566667777",` ~ "\n"
+		~ ` "origin_directory": "/work/proj", "username": "alice"}`);
+	write(buildPath(sourceDir, "messages.jsonl"),
+		`{"role": "user", "content": "one", "injected": false}` ~ "\n"
+		~ `{"role": "assistant", "content": "two", "injected": false}` ~ "\n");
+
+	auto agent = new VibeAgent;
+	auto profile = NativeHistoryProfile(AgentDriver.vibe, root);
+	auto newSessionId = "bbbb2222-3333-4444-5555-666677778888";
+	auto dest = agent.createHistoryForkDestination(newSessionId,
+		buildPath(sourceDir, "messages.jsonl"), profile);
+
+	auto newDir = dirName(dest);
+	assert(baseName(newDir).canFind("bbbb2222"),
+		baseName(newDir));
+	assert(baseName(newDir).startsWith("session_"), baseName(newDir));
+	assert(baseName(dest) == "messages.jsonl");
+	assert(!exists(dest), "forkTask writes the transcript, not the destination");
+
+	auto meta = readText(buildPath(newDir, "meta.json"));
+	assert(meta.canFind(`"session_id": "bbbb2222-3333-4444-5555-666677778888"`),
+		meta);
+	assert(meta.canFind(`"username": "alice"`), meta);
+	assert(meta.canFind(`"origin_directory": "/work/proj"`), meta);
+	assert(meta.canFind(`"total_messages": 2`), meta);
+	// The pydantic-required fields must all be present as keys.
+	foreach (field; ["start_time", "end_time", "git_commit", "git_branch",
+		"environment", "child_sessions", "loops", "title_source"])
+		assert(meta.canFind(field), field ~ " missing: " ~ meta);
 }

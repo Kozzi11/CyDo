@@ -32,7 +32,7 @@ async function expectSubtaskResult(page: Page, text: string, timeout: number) {
 }
 
 test("project memory is injected into first user message",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {
@@ -54,7 +54,7 @@ test("project memory is injected into first user message",
   }
 });
 
-test("project memory marker appears in user message text (not only system prompt)", { tag: ["@no-copilot", "@no-vibe"] }, async ({
+test("project memory marker appears in user message text (not only system prompt)", { tag: ["@no-copilot"] }, async ({
   page,
   agentType,
 }) => {
@@ -80,7 +80,7 @@ test("project memory marker appears in user message text (not only system prompt
 });
 
 test("MEMORY.md absent: framing injected with placeholder body",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {
@@ -110,7 +110,7 @@ test("MEMORY.md absent: framing injected with placeholder body",
 });
 
 test("task type with memory: false does not receive memory block",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {
@@ -132,7 +132,7 @@ test("task type with memory: false does not receive memory block",
 });
 
 test("read-only task can write to memory carve-out",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {
@@ -159,7 +159,7 @@ test("read-only task can write to memory carve-out",
 });
 
 test("worktree-bound task writes via absolute path land in canonical store",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {
@@ -188,7 +188,7 @@ test("worktree-bound task writes via absolute path land in canonical store",
 });
 
 test("memory written by one task is visible to the next task",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {

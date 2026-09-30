@@ -1,4 +1,4 @@
-# Vibe Support — Session State (updated 2026-09-21, afternoon)
+# Vibe Support — Session State (updated 2026-09-30)
 
 Companion to `docs/plans/vibe-support-implementation.md`. The work below
 landed in commit `a786a82` (`test(e2e): add vibe project with smoke
@@ -246,3 +246,65 @@ in 4 spec files.
    27-28) before I switched to an isolated port-3941 repro. Nothing in
    ~/.local/share/cydo/cydo.db was touched (mtime Sep 19); the stray
    tasks live in whatever data dir that backend uses — delete at will.
+
+## Session 2026-09-30 — followups landed (fork/undo, prompt reframing, 23 more specs)
+
+The interrupted 2026-09-23/24 session left an uncommitted tree with two
+features plus a batch of untagged specs. This session verified the whole
+tree against the gate (809 derivations; one unrelated claude flake that
+passed on retry) and landed it as one commit — a tests-only first commit
+was attempted but the store no longer held the pre-feature backend's
+~800 e2e cells, and the gate requires every cell realized per tree
+(same atomicity constraint as the Part-3 landing above).
+
+**Feature 1 — vibe fork/undo via the generic jsonl machinery**
+(`vibe.d`, `operations.d`): `createHistoryForkDestination` synthesizes
+the fork's session dir — `session_<ts>_<id8>/meta.json` carrying the
+forked session_id (the required-field shape vibe's `session/load`
+validates, verified against 2.25.7; `total_messages` is metadata only)
+plus inherited username/origin_directory — so the generic fork machinery
+rewrites `messages.jsonl` into a resumable fork. Undo truncates
+`messages.jsonl` in place (session id unchanged).
+`selectHistoryOperations` flips vibe fork/undo to `HistoryOperationMechanism.jsonl`.
+In-file unit tests cover the destination shape.
+
+**Feature 2 — persisted-prompt reframing after keep_context mode switch**
+(`server/app.d`, `workflow/tools/backend.d`): agents without a native
+developer prompt (vibe) carry the task framing in the first persisted
+user message; after a keep_context switch the old mode's instructions
+would ride along forever. New `WorkflowToolsHost.reframePersistedSessionStart`
+(nullable; null = no reframe) rewrites the persisted
+"Session start:"/"Task prompt:" line — strip old framing, prepend the
+new mode's, keep the subject — before the reload broadcast. Runs before
+subscribers re-read history. Unit-tested (`reframeSessionStartLine`);
+the two `system-prompt-switch` vibe cells cover it end to end.
+
+**20 more vibe specs untagged and green** (all verified as nix check
+cells): attention-indicators ×4 (AskUserQuestion via the generic
+`mcp__cydo__*` chat-dialect mapping), auto-suggest ×4, project-memory ×7,
+resume L301 (MCP Task tool after backend restart — the generic tool_call
+dialect covers task spawn; no dedicated dialect was needed),
+draft-adoption-races L396, draft-lifecycle-races L1251,
+draft-type-persistence L233, system-prompt L9, plus undo L10 and
+system-prompt-switch ×2 gated on the two features above.
+
+**Gate**: dirty-tree `nix --option keep-going true flake check` — 809
+derivations, one failure `e2e-claude-follow-up-markdown-L8` that passed
+on immediate retry (flake; zero code overlap — the dirty tree only
+touches vibe paths and a mode-switch-only hook) plus the known
+environmental `packages.screenshots` gitlink error (fails on clean
+trees too; see above). All `checks.*` for the committed tree are
+realized; the pre-commit hook verified the exact commit.
+
+## Still deferred (next up)
+- The remaining `@no-vibe` tags (34 tags / 19 files as of this session):
+  ask-user-question ×3, continuation ×2, edit-raw-event ×4, fd-leak ×2,
+  follow-up-markdown ×1, parallel-task-null ×1, semantic-shell ×4,
+  subtask-result ×1, suggest-context ×2, suggestion-header ×2,
+  system-messages ×1, task-spawn-link ×1, task-type-change ×1,
+  ui-regression ×2, undo-claude-live-middle ×1, undo-steering ×1,
+  worktree-archive ×3, worktree-fork ×1, worktree-write-conflict ×1.
+  Clusters: web_search / compaction (totalTokens) mock dialect, worktree
+  mechanics, steering/live-middle undo, suggestion-context plumbing.
+- vibe resume-after-kill upstream race (`session/load` `-31002 'role'`
+  on killed-session logs) — still uninvestigated upstream.

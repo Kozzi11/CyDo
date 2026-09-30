@@ -231,7 +231,7 @@ test("entry point persists across page reload on draft", async ({ page }) => {
 });
 
 test("sending from isolated draft applies the isolated entry-point prompt",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {

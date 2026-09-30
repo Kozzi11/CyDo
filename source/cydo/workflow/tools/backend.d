@@ -118,6 +118,13 @@ struct WorkflowToolsHost
 	string delegate(string workspaceName) workspacePermissionPolicy;
 	void delegate(void delegate() cb) onNextTick;
 	void delegate(int tid, string prompt) generateTitle;
+
+	/// Rewrite the persisted session-start message's task framing after a
+	/// keep_context mode switch, for agents whose first user message carries
+	/// the framing inline (no native developer prompt). Null on hosts that
+	/// don't reframe persisted history (unittest fixtures); consumers treat
+	/// null as "no reframe needed".
+	void delegate(int tid, TaskTypeDef* newTypeDef) reframePersistedSessionStart = null;
 }
 
 unittest
@@ -1460,6 +1467,14 @@ private:
 			auto wasActive = td.status == TaskStatus.active;
 			td.taskType = contDef.task_type;
 			host_.persistTaskType(tid, contDef.task_type);
+
+			// Agents without a native developer prompt carry the task
+			// framing in the first persisted user message; reframe it so
+			// the relaunched session does not resurrect the old mode's
+			// instructions. Must precede the reload so subscribers read
+			// the rewritten history.
+			if (host_.reframePersistedSessionStart !is null)
+				host_.reframePersistedSessionStart(tid, newTypeDef);
 
 			if (!wasActive)
 				host_.transitionTaskFrom(tid,

@@ -394,7 +394,7 @@ test("direct persisted draft route adopts after its initial task snapshot", asyn
 });
 
 test("held incremental bootstrap keeps an archived child route truthful",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   browser,
   baseURL,

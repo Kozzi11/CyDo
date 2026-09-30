@@ -8,7 +8,7 @@ import {
 } from "./fixtures";
 
 test("suggestions appear after agent responds",
-    { tag: "@no-vibe" }, async ({ page, agentType }) => {
+    async ({ page, agentType }) => {
   await enterSession(page);
   await sendMessage(page, 'Please reply with "done"');
 
@@ -28,7 +28,7 @@ test("suggestions appear after agent responds",
 });
 
 test("suggestions disappear when user types",
-    { tag: "@no-vibe" }, async ({ page, agentType }) => {
+    async ({ page, agentType }) => {
   await enterSession(page);
   await sendMessage(page, 'Please reply with "done"');
 
@@ -51,7 +51,7 @@ test("suggestions disappear when user types",
 });
 
 test("clicking suggestion sends it immediately",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {
@@ -85,7 +85,7 @@ test("clicking suggestion sends it immediately",
 });
 
 test("shift+click suggestion pre-fills input without sending",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {

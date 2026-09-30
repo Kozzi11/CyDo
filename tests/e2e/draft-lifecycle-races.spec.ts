@@ -1249,7 +1249,7 @@ test("post-tid clear and retype waits for the genuine deletion acknowledgement",
 });
 
 test("submitting during a held empty create delivers one raw message after acknowledgement",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {

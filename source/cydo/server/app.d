@@ -85,7 +85,9 @@ import cydo.runtime.launch.types : NativeHistoryProfile, NativeHistoryRule;
 import cydo.domain.task_types.definition : DjinjaTemplate, TaskTypeDef, OutputType, WorktreeMode, byName, loadTaskTypes,
 	loadTaskTypeSystemPrompt, renderPrompt, substituteVars,
 	loadProjectMemory, resolveAgent;
-import cydo.foundation.system.framing : prependTaskFraming, validateTemplateSource;
+import cydo.foundation.system.framing : ParsedSystemFraming, prependTaskFraming,
+	stripTaskSystemPromptWrapper, tryParseSystemFraming, wrapSystemMessage,
+	validateTemplateSource;
 import cydo.foundation.system.known_messages : KnownSystemMessageKind,
 	sessionStartSubject, systemMessagePrefix, wrapKnownSystemMessage;
 import cydo.foundation.platform.path : bestEffortProjectPathIdentity, canonicalProjectPath;
@@ -540,6 +542,7 @@ class App
 			generateTitle: (int tid, string prompt) {
 				derivedTextJobs.generateTitle(tid, prompt);
 			},
+			reframePersistedSessionStart: &reframePersistedSessionStart,
 		));
 		historyPipeline = new HistoryEventPipeline(HistoryEventPipelineHost(
 			getTask: (int tid) => tid in tasks ? &tasks[tid] : null,
@@ -2533,6 +2536,123 @@ class App
 		td.history.load((ulong) => LoadedHistory.init);
 		historyPipeline.appendTaskDiagnostic(tid, "Failed to load session history", body);
 		emitTaskReload(tid, "history_unavailable");
+	}
+
+	/// Rewrite the persisted session-start message after a keep_context mode
+	/// switch. Agents with a native developer prompt (claude, copilot) get
+	/// the new task system prompt at relaunch and never framed the first
+	/// user message; for the others (vibe) the old mode's framing would
+	/// otherwise ride along in the resumed conversation forever.
+	private void reframePersistedSessionStart(int tid, TaskTypeDef* newTypeDef)
+	{
+		import std.file : exists, readText, write;
+		import std.string : lineSplitter;
+		auto agent = tryAgentForTask(tid);
+		if (agent is null || agent.supportsDeveloperPrompt)
+			return;
+		auto tdp = tid in tasks;
+		if (tdp is null || newTypeDef is null || tdp.agentSessionId.length == 0)
+		{
+			tracef("reframePersistedSessionStart[%d]: skip (task/type/session)", tid);
+			return;
+		}
+		auto td = tdp;
+
+		auto resolution = resolveTaskHistory(tid);
+		if (resolution.kind != TaskHistoryResolutionKind.access)
+		{
+			tracef("reframePersistedSessionStart[%d]: skip (no history access: %s)",
+				tid, resolution.kind);
+			return;
+		}
+		auto path = resolution.requireAccess().path;
+		if (path.length == 0 || !exists(path))
+		{
+			tracef("reframePersistedSessionStart[%d]: skip (no history file: %s)",
+				tid, path);
+			return;
+		}
+
+		auto taskTypes = taskTypeCatalog.getTaskTypesForProject(td.projectPath);
+		auto newSystemPrompt = loadTaskTypeSystemPrompt(*newTypeDef, taskTypes,
+			td.taskType, taskTypeCatalog.promptSearchPath(td.projectPath),
+			taskPathResolver.outputPath(*td));
+		auto newMemory = loadProjectMemory(newTypeDef, td.repoPath,
+			taskTypeCatalog.promptSearchPath(td.projectPath));
+
+		string rewritten;
+		bool reframed;
+		foreach (line; readText(path).lineSplitter)
+		{
+			if (!reframed && line.length > 0)
+			{
+				auto newLine = reframeSessionStartLine(line, config.system_keyword,
+					newSystemPrompt, newMemory);
+				if (newLine !is null)
+				{
+					line = newLine;
+					reframed = true;
+				}
+			}
+			rewritten ~= line ~ "\n";
+		}
+		if (!reframed)
+		{
+			tracef("reframePersistedSessionStart[%d]: no session-start line in %s",
+				tid, path);
+			return;
+		}
+		write(path, rewritten);
+		tracef("reframePersistedSessionStart[%d]: reframed session start for type %s",
+			tid, td.taskType);
+	}
+
+	/// Reframe one persisted LLM-message line's task-prompt content: strip the
+	/// old task framing and prepend the new one, preserving the original
+	/// subject (it encodes how the session/spawn edge began). Returns null
+	/// when the line is not a session-start or task-prompt known system
+	/// message.
+	private static string reframeSessionStartLine(string line, string keyword,
+		string newSystemPrompt, string newMemory)
+	{
+		import std.algorithm : startsWith;
+		import std.json : JSONType, JSONValue, parseJSON;
+
+		@JSONPartial static struct LineProbe
+		{
+			string role;
+			@JSONOptional string content;
+			@JSONOptional bool injected;
+		}
+		LineProbe probe;
+		try
+			probe = jsonParse!LineProbe(line);
+		catch (Exception)
+			return null;
+		if (probe.role != "user" || probe.injected || probe.content.length == 0)
+			return null;
+
+		ParsedSystemFraming parsed;
+		if (!tryParseSystemFraming(keyword, probe.content, parsed))
+			return null;
+		// The task framing rides either in the entry-point session-start
+		// message ("Session start: <name>") or in the Task-tool spawn prompt
+		// ("Task prompt: <parentType> -> <edgeName>").
+		if (!parsed.subject.startsWith("Session start: ")
+			&& !parsed.subject.startsWith("Task prompt: "))
+			return null;
+
+		auto rendered = stripTaskSystemPromptWrapper(parsed.body);
+		auto newBody = prependTaskFraming(rendered, newSystemPrompt, newMemory);
+		auto newContent = wrapSystemMessage(keyword, parsed.subject, newBody);
+
+		auto json = parseJSON(line);
+		if (json.type != JSONType.object
+			|| "content" !in json.object
+			|| json.object["content"].type != JSONType.string)
+			return null;
+		json.object["content"] = JSONValue(newContent);
+		return json.toString();
 	}
 
 	private HistoryForkDestination prepareHistoryForkDestination(int sourceTid)
@@ -5953,4 +6073,64 @@ unittest
 	// and undoStopInProgress onExit branches.
 	checkNeverLoaded((App app, int tid) => app.resetHistoryWatermarkOnly(tid), "only");
 	checkAlreadyLoaded((App app, int tid) => app.resetHistoryWatermarkOnly(tid), "only");
+}
+
+unittest
+{
+	// reframeSessionStartLine: the persisted session-start / task-prompt
+	// message keeps the rendered prompt and its subject, but swaps the old
+	// mode's framing for the new one.
+	import std.algorithm : canFind;
+	import std.json : parseJSON;
+
+	auto oldBody = prependTaskFraming("do the thing", "OLD MODE MARKER",
+		"old memory block\n");
+	auto line = `{"role": "user", "content": `
+		~ toJson(wrapSystemMessage("SYSTEM", "Session start: mode_a", oldBody))
+		~ `, "message_id": "m1", "injected": false}`;
+
+	auto reframed = App.reframeSessionStartLine(line, "SYSTEM",
+		"NEW MODE MARKER", "new memory block\n");
+	assert(reframed !is null, reframed);
+
+	auto parsed = parseJSON(reframed);
+	assert(parsed["role"].str == "user");
+	assert(parsed["message_id"].str == "m1");
+	assert(!parsed["injected"].boolean);
+	auto content = parsed["content"].str;
+	// The subject is preserved — it records how the session/spawn began.
+	assert(content.canFind("Session start: mode_a"), content);
+	assert(content.canFind("NEW MODE MARKER"), content);
+	assert(content.canFind("new memory block"), content);
+	assert(content.canFind("do the thing"), content);
+	assert(!content.canFind("OLD MODE MARKER"), content);
+	assert(!content.canFind("old memory block"), content);
+
+	// Task-spawned children carry the framing in the Task prompt message.
+	auto taskLine = `{"role": "user", "content": `
+		~ toJson(wrapSystemMessage("SYSTEM",
+			"Task prompt: conversation -> mode_a", oldBody))
+		~ `, "injected": false}`;
+	auto reframedTask = App.reframeSessionStartLine(taskLine, "SYSTEM",
+		"NEW MODE MARKER", null);
+	assert(reframedTask !is null, reframedTask);
+	assert(parseJSON(reframedTask)["content"].str.canFind(
+		"Task prompt: conversation -> mode_a"));
+	assert(parseJSON(reframedTask)["content"].str.canFind("NEW MODE MARKER"));
+
+	// Not a task-framing message: assistant lines and other subjects are
+	// left alone (null).
+	assert(App.reframeSessionStartLine(
+		`{"role": "assistant", "content": "hi", "injected": false}`,
+		"SYSTEM", "NEW", null) is null);
+	assert(App.reframeSessionStartLine(
+		`{"role": "user", "content": `
+			~ toJson(wrapSystemMessage("SYSTEM", "Question from task 1 (qid=1)",
+				"what?"))
+			~ `, "injected": false}`,
+		"SYSTEM", "NEW", null) is null);
+	// Array content (multimodal) is not reframed.
+	assert(App.reframeSessionStartLine(
+		`{"role": "user", "content": [{"type": "image", "data": "x"}]}`,
+		"SYSTEM", "NEW", null) is null);
 }

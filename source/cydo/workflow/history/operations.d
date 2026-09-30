@@ -36,11 +36,14 @@ HistoryOperations selectHistoryOperations(AgentDriver driver,
 		result.undo.agent_turn = HistoryOperationMechanism.jsonl;
 		return result;
 	case AgentDriver.vibe:
-		// History parsing is wired (translateHistoryLine/boundaries), but
-		// fork and undo stay unavailable: the jsonl fork machinery rewrites
-		// only messages.jsonl, while a resumable vibe fork additionally
-		// needs a new session dir whose meta.json carries the forked
-		// session_id.
+		// Fork and undo ride the generic jsonl machinery: the fork
+		// destination is a synthesized session dir whose meta.json carries
+		// the forked session_id (createHistoryForkDestination), and undo
+		// truncates messages.jsonl in place — the session id is unchanged.
+		result.fork.user = HistoryOperationMechanism.jsonl;
+		result.fork.agent_turn = HistoryOperationMechanism.jsonl;
+		result.undo.user = HistoryOperationMechanism.jsonl;
+		result.undo.agent_turn = HistoryOperationMechanism.jsonl;
 		return result;
 	}
 	switch (codexForkSource)
@@ -105,6 +108,12 @@ unittest
 		CodexForkSourceState.dead);
 	assert(claude.fork.user == HistoryOperationMechanism.jsonl);
 	assert(claude.undo.agent_turn == HistoryOperationMechanism.jsonl);
+	auto vibe = selectHistoryOperations(AgentDriver.vibe,
+		CodexForkSourceState.dead);
+	assert(vibe.fork.user == HistoryOperationMechanism.jsonl);
+	assert(vibe.fork.agent_turn == HistoryOperationMechanism.jsonl);
+	assert(vibe.undo.user == HistoryOperationMechanism.jsonl);
+	assert(vibe.undo.agent_turn == HistoryOperationMechanism.jsonl);
 	auto boundary = HistoryBoundary("a", HistoryBoundaryKind.agent_turn, "");
 	assert(allowsOperation(boundary, offline, HistoryOperation.undo));
 	assert(!allowsOperation(boundary, native, HistoryOperation.undo));
