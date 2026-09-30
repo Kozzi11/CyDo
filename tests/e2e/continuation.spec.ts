@@ -228,6 +228,8 @@ function assertRepairedContinuationHistory(
     assertClaudeContinuationResult(rows, tool, successPrefix);
   } else if (agentType === "codex") {
     assertCodexContinuationResult(rows, tool, successPrefix);
+  } else if (agentType === "vibe") {
+    assertVibeContinuationResult(rows, rawHistory, tool, successPrefix);
   } else {
     assertCopilotContinuationResult(rows, tool, successPrefix);
     return;
@@ -236,12 +238,54 @@ function assertRepairedContinuationHistory(
   for (const fragment of rejectedContinuationHistoryFragments) {
     expect(rawHistory, `Unexpected stale continuation history: ${fragment}`).not.toContain(
       fragment,
-    );
+  );
   }
 }
 
-test("keep_context continuation injects prompt template",
-    { tag: "@no-vibe" }, async ({
+// Vibe persists one LLM message per line: the SwitchMode/Handoff call is an
+// assistant tool_calls entry and its outcome a paired role:"tool" line.
+function assertVibeContinuationResult(
+  rows: JsonRecord[],
+  rawHistory: string,
+  tool: ContinuationTool,
+  successPrefix: string,
+) {
+  const calls: JsonRecord[] = [];
+  for (const row of rows) {
+    if (row.role !== "assistant" || !Array.isArray(row.tool_calls)) continue;
+    for (const call of row.tool_calls) {
+      if (
+        isJsonRecord(call) &&
+        isJsonRecord(call.function) &&
+        call.function.name === `cydo_${tool}`
+      ) {
+        calls.push(call);
+      }
+    }
+  }
+  const call = exactlyOne(calls, `Expected one vibe cydo_${tool} tool call`);
+  const callId = requireJsonString(call.id, `Vibe ${tool} tool call id`);
+  const results = rows.filter(
+    (row) => row.role === "tool" && row.tool_call_id === callId,
+  );
+  const result = exactlyOne(
+    results,
+    `Expected one vibe ${tool} tool result for ${callId}`,
+  );
+  // The backend interrupts the session right after a SwitchMode/Handoff
+  // succeeds ("the agent must yield"), so vibe records the tool outcome as
+  // its user-cancellation marker — the equivalent of claude's repaired
+  // rejection record. A result delivered before the cancel would carry the
+  // success text instead; accept either.
+  const resultJson = JSON.stringify(result);
+  expect(
+    resultJson.includes(successPrefix) ||
+      resultJson.includes("interrupted by user"),
+    `Vibe ${tool} result should report the switch or the yield cancellation`,
+  ).toBe(true);
+}
+
+test("keep_context continuation injects prompt template", async ({
   page,
   agentType,
 }) => {
@@ -283,8 +327,7 @@ test("keep_context continuation injects prompt template",
   }
 });
 
-test("keep_context SwitchMode preface uses continuation key",
-    { tag: "@no-vibe" }, async ({
+test("keep_context SwitchMode preface uses continuation key", async ({
   page,
   agentType,
 }) => {
@@ -303,8 +346,7 @@ test("keep_context SwitchMode preface uses continuation key",
   ).toBeVisible();
 });
 
-test("mode switch replay rebuilds known system message metadata",
-    { tag: "@no-vibe" }, async ({
+test("mode switch replay rebuilds known system message metadata", async ({
   page,
   agentType,
 }) => {
@@ -359,8 +401,7 @@ test("unsent steer is either recovered into input box or shown in history after 
   }).toPass();
 });
 
-test("handoff continuation exit navigates to grandparent, not completed parent",
-    { tag: "@no-vibe" }, async ({
+test("handoff continuation exit navigates to grandparent, not completed parent", async ({
   page,
   agentType,
 }) => {
@@ -469,8 +510,7 @@ test("handoff continuation exit navigates to grandparent, not completed parent",
   }
 });
 
-test("handoff replay rebuilds known system message metadata",
-    { tag: "@no-vibe" }, async ({
+test("handoff replay rebuilds known system message metadata", async ({
   page,
   agentType,
 }) => {
@@ -538,8 +578,7 @@ test("handoff replay rebuilds known system message metadata",
   ).toBeVisible({ timeout });
 });
 
-test("SwitchMode from sub-task sends is_continuation flag",
-    { tag: "@no-vibe" }, async ({
+test("SwitchMode from sub-task sends is_continuation flag", async ({
   page,
   agentType,
 }) => {
@@ -709,8 +748,7 @@ test("on_yield does not fire on non-zero exit", { tag: ["@no-codex", "@no-vibe"]
   expect(continuationCreated).toBeFalsy();
 });
 
-test("input box stays empty after mode switch",
-    { tag: "@no-vibe" }, async ({ page, agentType }) => {
+test("input box stays empty after mode switch", async ({ page, agentType }) => {
   const liveInterruptionUuids: string[] = [];
   const continuationReloads: ContinuationReload[] = [];
   page.on("websocket", (ws) => {

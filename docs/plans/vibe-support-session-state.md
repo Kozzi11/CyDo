@@ -115,6 +115,20 @@ in 4 spec files.
    vibe e2e checks pass against 2.25.7 (the driver's auto-approve
    handles any new cydo_* permission requests). Driver comments now
    cite the verified range 2.25.4–2.25.7.
+0b. Done this session: **the whole continuation family runs for vibe**
+   (all 8 specs: SwitchMode keep_context ×2, mode-switch replay,
+   handoff exit navigation, handoff replay, sub-task SwitchMode
+   is_continuation, input-box-empty after mode switch). Enablers:
+   check_context/check_user_text intents in the chat dialect; the
+   fixtures AgentType union + lookupTaskSession + a vibe case in
+   historyPathForTask (scan session dirs by first-8 of the session id,
+   newest wins); and a vibe branch in
+   assertRepairedContinuationHistory — the backend interrupts the
+   session right after SwitchMode/Handoff ("the agent must yield"),
+   so vibe persists the tool outcome as its
+   "<user_cancellation>…interrupted by user…" marker, the equivalent
+   of claude's repaired rejection record; the assertion accepts
+   either that or the success text.
 1. Done this session (afternoon): Part 4 history parsing —
    `translateHistoryLine` (persisted LLM-message lines → agnostic items,
    turn synthesis), `extractPersistedHistoryBoundaries` (message_id

@@ -12,7 +12,7 @@ import {
 } from "fs";
 import { join } from "path";
 
-type AgentType = "claude" | "codex" | "copilot";
+type AgentType = "claude" | "codex" | "copilot" | "vibe";
 
 export function currentTaskTid(page: Page): number {
   const match = page.url().match(/\/task\/(\d+)(?:$|[/?#])/);
@@ -35,7 +35,8 @@ export function lookupTaskSession(
   const [sessionId, projectPath, agentType] = row.split("|");
   if (!sessionId || !projectPath || !agentType)
     throw new Error(`Incomplete task row for tid ${tid}: ${row}`);
-  if (agentType !== "claude" && agentType !== "codex" && agentType !== "copilot")
+  if (agentType !== "claude" && agentType !== "codex" && agentType !== "copilot"
+    && agentType !== "vibe")
     throw new Error(`Unexpected agent type ${agentType}`);
   return { sessionId, projectPath, agentType };
 }
@@ -74,6 +75,27 @@ export function historyPathForTask(tid: number): string {
     }
     case "copilot":
       return `/tmp/copilot-test-home/session-state/${sessionId}/events.jsonl`;
+    case "vibe": {
+      // Vibe names session dirs session_<ts>_<first 8 of the session id>;
+      // resolve by prefix, newest dir wins (mirrors the driver's logic).
+      const sessionsDir = "/tmp/vibe-test-home/logs/session";
+      const prefix = `session_`;
+      const idPrefix = sessionId.slice(0, 8);
+      const candidates = existsSync(sessionsDir)
+        ? readdirSync(sessionsDir)
+            .filter(
+              (name) =>
+                name.startsWith(prefix) &&
+                name.split("_")[3]?.slice(0, 8) === idPrefix,
+            )
+            .sort()
+        : [];
+      for (let i = candidates.length - 1; i >= 0; i--) {
+        const candidate = `${sessionsDir}/${candidates[i]}/messages.jsonl`;
+        if (existsSync(candidate)) return candidate;
+      }
+      throw new Error(`Could not find vibe history file for ${sessionId}`);
+    }
   }
 }
 

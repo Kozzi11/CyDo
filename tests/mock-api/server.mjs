@@ -1554,7 +1554,18 @@ function handleChatCompletions(req, res) {
 
     // Map intents to chat-completions responses. Vibe's bash tool takes
     // {command}; MCP tool calls use the vibe-side `cydo_<Tool>` name.
-    if (intent.type === "text") {
+    if (intent.type === "check_context") {
+      const needle = Buffer.from(intent.needle, "base64").toString("utf-8");
+      const haystack = JSON.stringify(parsed);
+      const found = haystack.includes(needle);
+      emitText(found ? "context-check-passed" : "context-check-failed");
+      finishStream();
+    } else if (intent.type === "check_user_text") {
+      const needle = Buffer.from(intent.needle, "base64").toString("utf-8");
+      const found = typeof userText === "string" && userText.includes(needle);
+      emitText(found ? "context-check-passed" : "context-check-failed");
+      finishStream();
+    } else if (intent.type === "text") {
       emitText(intent.text);
       finishStream();
     } else if (intent.type === "held_title") {
