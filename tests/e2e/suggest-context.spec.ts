@@ -39,7 +39,7 @@ async function getSuggestionTexts(
 // Index 2 = conversation body (abbreviated history body)
 
 test("multi-turn suggestion context has no spurious [...] markers",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {
@@ -84,7 +84,7 @@ test("multi-turn suggestion context has no spurious [...] markers",
 });
 
 test("suggestion context truncates by turns not entries",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {

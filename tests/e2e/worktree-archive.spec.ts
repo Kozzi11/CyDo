@@ -10,7 +10,7 @@ import {
 } from "./fixtures";
 import type { Page, AgentType } from "./fixtures";
 
-test("archive and unarchive a spike task's worktree", { tag: ["@no-codex", "@no-vibe"] }, async ({
+test("archive and unarchive a spike task's worktree", { tag: ["@no-codex"] }, async ({
   page,
   agentType,
   backend,
@@ -115,7 +115,7 @@ test("archive and unarchive a spike task's worktree", { tag: ["@no-codex", "@no-
   expect(existsSync(wtDir)).toBe(true);
 });
 
-test("cannot archive parent with alive descendant", { tag: ["@no-codex", "@no-vibe"] }, async ({
+test("cannot archive parent with alive descendant", { tag: ["@no-codex"] }, async ({
   page,
   agentType,
 }) => {
@@ -202,7 +202,7 @@ test("cannot archive parent with alive descendant", { tag: ["@no-codex", "@no-vi
   }
 });
 
-test("archiving parent task archives spike's worktree", { tag: ["@no-codex", "@no-vibe"] }, async ({
+test("archiving parent task archives spike's worktree", { tag: ["@no-codex"] }, async ({
   page,
   agentType,
   backend,

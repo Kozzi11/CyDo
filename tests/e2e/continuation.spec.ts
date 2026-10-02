@@ -639,7 +639,7 @@ test("SwitchMode from sub-task sends is_continuation flag", async ({
 });
 
 test("on_yield continuation auto-fires on clean exit",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {
@@ -682,7 +682,7 @@ test("on_yield continuation auto-fires on clean exit",
   }).toPass();
 });
 
-test("on_yield does not fire on non-zero exit", { tag: ["@no-codex", "@no-vibe"] }, async ({ page, agentType }) => {
+test("on_yield does not fire on non-zero exit", { tag: ["@no-codex"] }, async ({ page, agentType }) => {
   // Keep Codex skipped for now: in this mocked stall path, Codex/mock behavior
   // is not yet deterministic enough to keep the child stalled until kill assertion.
 

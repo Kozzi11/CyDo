@@ -11,7 +11,7 @@ import {
 // The suggestion prompt's [Session: N user messages, ...] header should reflect
 // the actual number of user messages sent, not 0.
 test("suggestion header reports correct user message count",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {
@@ -61,7 +61,7 @@ test("suggestion header reports correct user message count",
 // so extractMessageText() returns empty and assistant entries are skipped.
 // The abbreviated history should contain "A: ..." entries for assistant responses.
 test("suggestion history includes assistant text entries",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {

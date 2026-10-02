@@ -202,7 +202,7 @@ function createImportWorkDir(suffix: string): { workDir: string; workerHome: str
 }
 
 test("edit raw JSON event persists to disk across reload",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {
@@ -226,7 +226,7 @@ test("edit raw JSON event persists to disk across reload",
 });
 
 test("clearing raw JSON deletes the source line instead of writing null",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {
@@ -248,7 +248,7 @@ test("clearing raw JSON deletes the source line instead of writing null",
 });
 
 test("editing raw JSON to two top-level objects expands into two history lines",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {
@@ -276,7 +276,7 @@ test("editing raw JSON to two top-level objects expands into two history lines",
 });
 
 test("invalid raw JSON edit is rejected and leaves the JSONL file unchanged",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {

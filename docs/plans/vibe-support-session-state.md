@@ -1,4 +1,4 @@
-# Vibe Support — Session State (updated 2026-09-30)
+# Vibe Support — Session State (updated 2026-10-02)
 
 Companion to `docs/plans/vibe-support-implementation.md`. The work below
 landed in commit `a786a82` (`test(e2e): add vibe project with smoke
@@ -308,3 +308,47 @@ realized; the pre-commit hook verified the exact commit.
   mechanics, steering/live-middle undo, suggestion-context plumbing.
 - vibe resume-after-kill upstream race (`session/load` `-31002 'role'`
   on killed-session logs) — still uninvestigated upstream.
+
+## Session 2026-10-02 — the last @no-vibe tags removed (34 cells)
+
+All 34 remaining `@no-vibe` tags across 19 spec files were removed;
+**31 cells passed as-is** against the committed tree (the generic
+`mcp__cydo__*` chat-dialect tool mapping plus the landed fork/undo/
+outcome work carry them: ask-user-question ×3, attention, auto-suggest
+already done, continuation on_yield ×2, fd-leak ×2, follow-up-markdown,
+parallel-task-null, semantic-shell ×4, subtask-result, suggest-context
+×2, suggestion-header ×2, task-spawn-link, task-type-change, ui-regression
+×2, undo-claude-live-middle, undo-steering, worktree-archive ×3,
+worktree-fork, worktree-write-conflict). Three needed real fixes:
+
+1. **edit-raw-event L228/L250 — vibe history segments never closed the
+   frontend streaming message** (`vibe.d`): claude emits `turn/stop` at
+   every assistant message_stop, so each persisted assistant line becomes
+   its own UI message with its own raw-source span. Vibe's
+   `translateHistoryLine` only emitted turn/stop+turn/result for
+   plain-content lines, so a tool+text turn loaded from messages.jsonl
+   rendered as ONE message whose first raw source was the tool_calls
+   line — raw-edit anchoring then edited the wrong JSONL line (the
+   "clear line" test deleted one event's line instead of four, and the
+   "expand into two lines" test could not find the visible text in the
+   raw JSON). Fix: a tool_calls-only assistant line now also emits a
+   segment-closing `turn/stop` (claude's per-line shape); the
+   plain-content line keeps its turn/stop+turn/result pair.
+2. **system-messages L93 — focus_hint race, test-side** (fast vibe
+   turns): the child `research` task completes before the test clicks
+   it, and the backend's one-shot `focus_hint` (child → parent, emitted
+   when the parent digests the sub-task result) lands after the test's
+   navigation, yanking the view back to the parent. The test now waits
+   for the child to complete AND the parent's input to re-enable, then
+   navigates by URL inside a `toPass` retry (hints are one-shot, so the
+   second attempt sticks). Live and post-reload assertions unchanged.
+3. Debugging was done with a local repro loop
+   (`nix develop -ic dub build` binary + `/tmp/appbin` base dir with
+   tests/defs/task-types.yaml, mock-api on :9000, `isolate_filesystem:
+   false` config, `nix develop -ic env -C tests playwright ...`);
+   the nix cells remain the only gate.
+
+After the fixes the three cells pass locally; the full gate
+(`nix --option keep-going true flake check`) re-verifies everything —
+the vibe.d change alters reload grouping for tool turns, so the whole
+matrix rebuilds.

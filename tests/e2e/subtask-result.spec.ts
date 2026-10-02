@@ -1,7 +1,7 @@
 import { test, expect, enterSession, sendMessage } from "./fixtures";
 
 test("sub-task result text delivered to parent",
-    { tag: "@no-vibe" }, async ({ page }) => {
+    async ({ page }) => {
   await enterSession(page);
 
   // The parent creates a sub-task that replies with a specific marker text.

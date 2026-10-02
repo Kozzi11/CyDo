@@ -1053,6 +1053,17 @@ class VibeAgent : Agent
 								? call.function_.arguments : `{}`);
 						events ~= TranslatedEvent(toJson(toolStartEv), line);
 					}
+					// A tool_calls-only assistant line is one model segment:
+					// close it with turn/stop like claude's per-message-stop
+					// shape, so the frontend ends the streaming message here
+					// and the following plain-text line opens its own message
+					// (and raw-source span) instead of merging with the tool
+					// segment.
+					if (ev.content.length == 0)
+					{
+						TurnStopEvent toolStopEv;
+						events ~= TranslatedEvent(toJson(toolStopEv), line);
+					}
 				}
 				// A plain-content assistant message terminates the turn:
 				// synthesize the live protocol's turn/stop + turn/result pair.
@@ -4064,15 +4075,17 @@ unittest
 	assert(turnResult.subtype == "success" && turnResult.result == "OK");
 
 	// A tool_calls message emits tool_use items with the live naming
-	// contract; the turn stays open (no turn/result without content).
+	// contract plus a segment-closing turn/stop (the turn itself stays open:
+	// no turn/result without content).
 	auto toolCall = agent.translateHistoryLine(
 		`{"role": "assistant", "injected": false, "message_id": "a2", "tool_calls": [{"id": "call_1", "index": 0, "type": "function", "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}}]}`, 5);
-	assert(toolCall.length == 1);
+	assert(toolCall.length == 2);
 	auto toolItem = jsonParse!ItemStartedEvent(toolCall[0].translated);
 	assert(toolItem.item_type == "tool_use");
 	assert(toolItem.item_id == "vb-tool-call_1");
 	assert(toolItem.name == "bash" && toolItem.tool_server is null);
 	assert(toolItem.input.json == `{"command":"ls"}`);
+	assert(jsonParse!TurnStopEvent(toolCall[1].translated).type == "turn/stop");
 
 	// cydo_<tool> MCP names decompose into the canonical name + server.
 	auto cydoCall = agent.translateHistoryLine(

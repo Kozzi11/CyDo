@@ -9,7 +9,7 @@ import {
 } from "./fixtures";
 
 test("sidebar status dot reflects session state",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {
@@ -104,7 +104,7 @@ test("tool result with Bash output renders correctly", async ({
 });
 
 test("fork stays focused on forked session",
-    { tag: "@no-vibe" }, async ({ page, agentType }) => {
+    async ({ page, agentType }) => {
   const frames: any[] = [];
   let postReloadFrameStart = 0;
   page.on("websocket", (ws) => {

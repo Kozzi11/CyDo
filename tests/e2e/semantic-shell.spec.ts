@@ -103,7 +103,7 @@ test("semantic shell: cat read renders through file content preview", async ({
  * header line, body content, and terminator.
  */
 test("semantic shell: heredoc write renders header/body/footer",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {
@@ -207,7 +207,7 @@ test("semantic shell: unrecognized pipe stage falls back to normal rendering", a
  * content, and terminator, using the semantic-shell-script container.
  */
 test("semantic shell: heredoc script renders with syntax-highlighted body",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {
@@ -398,7 +398,7 @@ test("semantic shell: direct svg heredoc write offers rendered image preview", a
 });
 
 test("semantic shell: mixed-quoted markdown heredoc renders markdown body",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {
@@ -529,7 +529,7 @@ test("semantic shell: dynamic wrapper payload falls back to normal command input
 });
 
 test("semantic shell: rg structured output keeps per-line prefixes and independent line rendering",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   agentType,
 }) => {

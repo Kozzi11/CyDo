@@ -55,7 +55,7 @@ function getFdDetails(pid: number): string[] {
 }
 
 test("agent session teardown does not leak file descriptors",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   backend,
   agentType,
@@ -100,7 +100,7 @@ test("agent session teardown does not leak file descriptors",
 });
 
 test("FD count stays stable across multiple session cycles",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
   backend,
   agentType,

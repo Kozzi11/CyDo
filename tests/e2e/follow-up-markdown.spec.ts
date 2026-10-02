@@ -6,7 +6,7 @@ import { test, expect, enterSession, sendMessage } from "./fixtures";
 // the rendered body contains a <strong> element rather than raw **…** text.
 
 test("Follow-up from parent renders body as Markdown (live and after reload)",
-    { tag: "@no-vibe" }, async ({
+    async ({
   page,
 }) => {
   await enterSession(page);
