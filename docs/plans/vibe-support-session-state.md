@@ -296,7 +296,9 @@ environmental `packages.screenshots` gitlink error (fails on clean
 trees too; see above). All `checks.*` for the committed tree are
 realized; the pre-commit hook verified the exact commit.
 
-## Still deferred (next up)
+## Still deferred (next up) — superseded 2026-10-02 except the last item
+(The 34 tags below were all removed in the 2026-10-02 session; only the
+upstream race remains open.)
 - The remaining `@no-vibe` tags (34 tags / 19 files as of this session):
   ask-user-question ×3, continuation ×2, edit-raw-event ×4, fd-leak ×2,
   follow-up-markdown ×1, parallel-task-null ×1, semantic-shell ×4,
