@@ -113,7 +113,10 @@ private struct LoadSessionParams
 private struct VibePromptBlock
 {
 	string type = "text";
-	string text;
+	@JSONOptional string text;
+	// image blocks: base64 data + MIME (ACP ContentBlock image shape).
+	@JSONOptional string data;
+	@JSONOptional string mimeType;
 }
 
 private struct PromptParams
@@ -969,7 +972,21 @@ class VibeAgent : Agent
 		{
 			case "user":
 			{
-				@JSONPartial static struct UserProbe { string content; }
+				@JSONPartial static struct PersistedImageSource
+				{
+					@JSONOptional string kind;
+					@JSONOptional string path;
+				}
+				@JSONPartial static struct PersistedImage
+				{
+					@JSONOptional PersistedImageSource source;
+					@JSONOptional string mime_type;
+				}
+				@JSONPartial static struct UserProbe
+				{
+					string content;
+					@JSONOptional PersistedImage[] images;
+				}
 				UserProbe ev;
 				try ev = jsonParse!UserProbe(line);
 				catch (Exception)
@@ -979,10 +996,34 @@ class VibeAgent : Agent
 				ContentBlock cb;
 				cb.type = "text";
 				cb.text = ev.content;
+				ContentBlock[] content = [cb];
+				// Persisted images are session-dir attachment files; inline
+				// them back as base64 blocks so the reloaded transcript shows
+				// what the model saw. A missing attachment degrades to the
+				// text-only message.
+				foreach (ref image; ev.images)
+				{
+					if (image.source.path.length == 0)
+						continue;
+					try
+					{
+						import std.base64 : Base64;
+						import std.file : read;
+						auto bytes = read(image.source.path);
+						auto encoded = Base64.encode(cast(ubyte[]) bytes);
+						ContentBlock imageBlock;
+						imageBlock.type = "image";
+						imageBlock.data = cast(string) encoded;
+						imageBlock.media_type = image.mime_type.length > 0
+							? image.mime_type : "image/png";
+						content ~= imageBlock;
+					}
+					catch (Exception) {}
+				}
 				ItemStartedEvent startEv;
 				startEv.item_id = "vb-hist-user-" ~ anchor;
 				startEv.item_type = "user_message";
-				startEv.content = [cb];
+				startEv.content = content;
 				startEv.uuid = probe.message_id;
 				events ~= TranslatedEvent(toJson(startEv), line);
 				break;
@@ -1969,11 +2010,21 @@ class VibeSession : AgentSession, VibeSessionHandler
 		params.sessionId = sessionId_;
 		foreach (ref block; submission.content)
 		{
-			if (block.type != "text")
-				continue;
-			VibePromptBlock promptBlock;
-			promptBlock.text = block.text;
-			params.prompt ~= promptBlock;
+			if (block.type == "text")
+			{
+				VibePromptBlock promptBlock;
+				promptBlock.text = block.text;
+				params.prompt ~= promptBlock;
+			}
+			else if (block.type == "image" && block.data.length > 0)
+			{
+				VibePromptBlock promptBlock;
+				promptBlock.type = "image";
+				promptBlock.data = block.data;
+				promptBlock.mimeType = block.media_type.length > 0
+					? block.media_type : "image/png";
+				params.prompt ~= promptBlock;
+			}
 		}
 
 		submission.epoch = submissionEpoch_;
@@ -2055,12 +2106,16 @@ class VibeSession : AgentSession, VibeSessionHandler
 	Promise!AgentSubmissionReceipt sendMessage(const(ContentBlock)[] content,
 		string correlationId = null, bool isContextBootstrap = false)
 	{
-		// Extract text (only text blocks supported; throw on others).
+		// Extract text for the echo-correlation state (image blocks ride
+		// along in content; only text feeds the echo matcher).
 		string text;
 		foreach (ref b; content)
 		{
-			if (b.type == "text") text ~= b.text;
-			else throw new Exception("Unsupported content block type for Vibe: " ~ b.type);
+			if (b.type == "text")
+				text ~= b.text;
+			else if (b.type != "image")
+				throw new Exception("Unsupported content block type for Vibe: "
+					~ b.type);
 		}
 
 		auto submission = new PendingMessage(content, text, correlationId,
@@ -2085,7 +2140,10 @@ class VibeSession : AgentSession, VibeSessionHandler
 			"Vibe message submission was invalidated"));
 	}
 
-	@property bool supportsImages() const { return false; }
+	// ACP promptCapabilities.image — vibe stores pasted images as session
+	// attachments and forwards them to the provider; the model catalog must
+	// also declare supports_images (the e2e mock model does).
+	@property bool supportsImages() const { return true; }
 
 	void interrupt()
 	{
@@ -2258,11 +2316,13 @@ class VibeSession : AgentSession, VibeSessionHandler
 			return;
 		}
 
-		assert(expectedUserMessages.length > 0,
-			"Vibe user_message_chunk has no queued originating send");
-		auto expected = expectedUserMessages[0];
-		if (expected.done)
+		// An image prompt echoes as two chunks sharing one messageId: the
+		// text, then a resource_link pointing at the persisted attachment.
+		// The text completes the echo; the trailing resource_link (and any
+		// replay straggler) has nothing left to accumulate against.
+		if (expectedUserMessages.length == 0 || expectedUserMessages[0].done)
 			return;
+		auto expected = expectedUserMessages[0];
 		expected.accumulated ~= text;
 		bool diverged = expected.accumulated.length > expected.content.length
 			|| expected.content[0 .. expected.accumulated.length] != expected.accumulated;
@@ -2292,14 +2352,29 @@ class VibeSession : AgentSession, VibeSessionHandler
 	private TranslatedEvent buildUserEcho(PendingMessage submission, string text,
 		string messageId)
 	{
+		// The canonical echo mirrors what CyDo submitted: image blocks ride
+		// along after the text so the UI keeps the image when the pending
+		// echo is replaced by the confirmed one.
+		ContentBlock[] content;
 		ContentBlock cb;
 		cb.type = "text";
 		cb.text = text;
+		content ~= cb;
+		foreach (ref block; submission.content)
+		{
+			if (block.type != "image" || block.data.length == 0)
+				continue;
+			ContentBlock image;
+			image.type = "image";
+			image.data = block.data;
+			image.media_type = block.media_type;
+			content ~= image;
+		}
 		ItemStartedEvent userEv;
 		userEv.item_id = "vb-user-" ~ (messageId.length > 0 ? messageId
 			: activeTurnNamespace_ ~ "-" ~ to!string(nextItemIndex++));
 		userEv.item_type = "user_message";
-		userEv.content = [cb];
+		userEv.content = content;
 		if (messageId.length > 0)
 			userEv.uuid = messageId;
 		userEv.correlation_id = submission.correlationId;
@@ -3353,6 +3428,73 @@ unittest
 
 unittest
 {
+	// Image prompts: image ContentBlocks map onto ACP image prompt blocks
+	// (base64 data + mimeType), the confirmed user echo keeps the image
+	// alongside the text, and vibe's trailing resource_link chunk (the
+	// persisted-attachment echo sharing the text chunk's messageId) is a
+	// no-op once the echo completed.
+	auto connection = new TestVibeConnection;
+	auto server = makeTestVibeAcpProcess(connection);
+	auto session = attachSession(server, 1, null, "test-model", "/test/workdir",
+		SessionConfig.init);
+	assert(session.supportsImages);
+	string[] emitted;
+	session.onOutput = (TranslatedEvent event) {
+		emitted ~= event.translated;
+	};
+
+	auto image = ContentBlock("image", null);
+	image.data = "aW1hZ2UtZGF0YQ==";
+	image.media_type = "image/png";
+	auto submission = new TestVibeSubmissionOutcome(
+		session.sendMessage([ContentBlock("text", "describe this image"),
+			image], "img-nonce"));
+	assertVibePending(submission);
+
+	auto newRequest = connection.takeRequest("session/new");
+	connection.respond(newRequest,
+		acceptedVibeResponse(`{"sessionId":"native-vibe-1"}`));
+	drainVibePromiseNextTicks();
+	assertVibeAcceptedOnce(submission);
+	emitted = null;
+
+	auto promptRequest = connection.takeRequest("session/prompt");
+	auto promptParams = jsonParse!PromptParams(toJson(promptRequest.params));
+	assert(promptParams.prompt.length == 2);
+	assert(promptParams.prompt[0].type == "text"
+		&& promptParams.prompt[0].text == "describe this image");
+	assert(promptParams.prompt[1].type == "image");
+	assert(promptParams.prompt[1].data == "aW1hZ2UtZGF0YQ==");
+	assert(promptParams.prompt[1].mimeType == "image/png");
+
+	connection.receive(vibeUpdate("native-vibe-1",
+		`{"sessionUpdate":"user_message_chunk","messageId":"um1","content":{"type":"text","text":"describe this image"}}`));
+	drainVibePromiseNextTicks();
+	assert(emitted.length == 1);
+	auto echo = jsonParse!ItemStartedEvent(emitted[0]);
+	assert(echo.item_type == "user_message");
+	assert(echo.content.length == 2);
+	assert(echo.content[0].type == "text"
+		&& echo.content[0].text == "describe this image");
+	assert(echo.content[1].type == "image"
+		&& echo.content[1].data == "aW1hZ2UtZGF0YQ=="
+		&& echo.content[1].media_type == "image/png");
+
+	// The resource_link echo arrives after the text completed the echo; the
+	// queue is empty and it must neither crash nor emit anything.
+	emitted = null;
+	connection.receive(vibeUpdate("native-vibe-1",
+		`{"sessionUpdate":"user_message_chunk","messageId":"um1","content":{"type":"resource_link","uri":"/tmp/attach.png","name":"pasted-image.png","mimeType":"image/png"}}`));
+	drainVibePromiseNextTicks();
+	assert(emitted.length == 0);
+
+	connection.respond(promptRequest, acceptedVibeResponse(
+		`{"stopReason":"end_turn","usage":{"input_tokens":5,"output_tokens":5}}`));
+	drainVibePromiseNextTicks();
+}
+
+unittest
+{
 	// A failed session/prompt turn surfaces as stderr plus an errored turn
 	// result (acceptance already committed at request time), restores the
 	// idle state, and immediately submits the queued successor with a
@@ -4049,6 +4191,45 @@ unittest
 	assert(userItem.content.length == 1
 		&& userItem.content[0].text == "run command echo hi");
 	assert(user[0].raw.canFind("\"message_id\": \"u1\""));
+
+	// A user line with persisted images inlines the session attachment file
+	// back as a base64 image block; a missing attachment degrades to the
+	// text-only message.
+	{
+		import std.base64 : Base64;
+		import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir, write;
+		import std.path : buildPath;
+
+		auto attDir = buildPath(tempDir(), "cydo-vibe-hist-image");
+		if (exists(attDir))
+			rmdirRecurse(attDir);
+		mkdirRecurse(attDir);
+		scope (exit)
+			if (exists(attDir))
+				rmdirRecurse(attDir);
+		auto attPath = buildPath(attDir, "attach.png");
+		auto bytes = cast(ubyte[]) "png-bytes";
+		write(attPath, bytes);
+		auto expectedB64 = cast(string) Base64.encode(bytes);
+
+		auto withImage = agent.translateHistoryLine(
+			`{"role": "user", "content": "describe this image", "injected": false, "message_id": "u2", "images": [{"source": {"kind": "file", "path": "` ~ attPath ~ `"}, "alias": "pasted-image.png", "mime_type": "image/png"}]}`, 4);
+		assert(withImage.length == 1);
+		auto imageItem = jsonParse!ItemStartedEvent(withImage[0].translated);
+		assert(imageItem.content.length == 2);
+		assert(imageItem.content[0].type == "text"
+			&& imageItem.content[0].text == "describe this image");
+		assert(imageItem.content[1].type == "image"
+			&& imageItem.content[1].data == expectedB64
+			&& imageItem.content[1].media_type == "image/png");
+
+		auto missing = agent.translateHistoryLine(
+			`{"role": "user", "content": "describe this image", "injected": false, "message_id": "u3", "images": [{"source": {"kind": "file", "path": "` ~ buildPath(attDir, "gone.png") ~ `"}, "mime_type": "image/png"}]}`, 5);
+		assert(missing.length == 1);
+		auto missingItem = jsonParse!ItemStartedEvent(missing[0].translated);
+		assert(missingItem.content.length == 1
+			&& missingItem.content[0].type == "text");
+	}
 
 	// Without a message_id the line number becomes the anchor.
 	auto unkeyed = agent.translateHistoryLine(

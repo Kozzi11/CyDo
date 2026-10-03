@@ -867,6 +867,7 @@ EOF
               alias = "mock"
               temperature = 0.2
               thinking = "off"
+              supports_images = true
               auto_compact_threshold = 200000
 
               [tools.bash]

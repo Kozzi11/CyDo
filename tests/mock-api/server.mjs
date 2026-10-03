@@ -1483,16 +1483,37 @@ function handleChatCompletions(req, res) {
 
     // Last user text — vibe's system prompt rides in a `system` message, so
     // matching against the last non-tool message is sufficient for fixtures.
+    // Multimodal messages carry an OpenAI content array: join the text parts
+    // so pattern matching keeps working, and remember whether image parts
+    // rode along (the image arrives as an image_url data URI part).
     let userText = null;
+    let hasImages = false;
     for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === "user" && typeof messages[i].content === "string") {
-        userText = messages[i].content;
+      if (messages[i].role === "user") {
+        if (typeof messages[i].content === "string") {
+          userText = messages[i].content;
+        } else if (Array.isArray(messages[i].content)) {
+          const parts = messages[i].content;
+          const texts = parts
+            .filter((b) => b.type === "text" && typeof b.text === "string")
+            .map((b) => b.text);
+          if (texts.length > 0) userText = texts.join("\n");
+          hasImages = parts.some(
+            (b) =>
+              b.type === "image_url" &&
+              typeof b.image_url?.url === "string" &&
+              b.image_url.url.startsWith("data:"),
+          );
+        }
         break;
       }
     }
     const intent = userText === null ? null : matchPattern(userText);
+    if (hasImages && intent !== null && intent.type === "text") {
+      intent.text = "image received";
+    }
     console.log(
-      `[mock-api] [chat] model=${requestedModel} userText=${JSON.stringify(userText)} isToolResult=${isToolResult} msgCount=${messages.length}`,
+      `[mock-api] [chat] model=${requestedModel} userText=${JSON.stringify(userText)} isToolResult=${isToolResult} msgCount=${messages.length}${hasImages ? " images=true" : ""}`,
     );
 
     res.writeHead(200, {
