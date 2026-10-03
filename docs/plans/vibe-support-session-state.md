@@ -1,4 +1,4 @@
-# Vibe Support — Session State (updated 2026-10-02)
+# Vibe Support — Session State (updated 2026-10-03)
 
 Companion to `docs/plans/vibe-support-implementation.md`. The work below
 landed in commit `a786a82` (`test(e2e): add vibe project with smoke
@@ -354,3 +354,20 @@ After the fixes the three cells pass locally; the full gate
 (`nix --option keep-going true flake check`) re-verifies everything —
 the vibe.d change alters reload grouping for tool turns, so the whole
 matrix rebuilds.
+
+## Session 2026-10-03 — bump to mistral-vibe 2.25.8 (latest)
+
+v2.25.8 (2026-09-23) is the newest upstream release. Release-notes review:
+maintenance only from CyDo's perspective — Rust-CLI TUI polish, permission
+allowlist tightening (CyDo auto-approves prompts, so unaffected), MCP
+plugin startup fixes, a session-snapshot transcript-ordering fix
+(possibly related to the upstream resume-after-kill race — the race did
+not reproduce in the re-run matrix), and Unified Harness agent-profile
+fixes CyDo does not use. Nothing touches the ACP wire shapes, the
+messages.jsonl/meta.json storage format, or the generic-backend config
+surface; the release assets keep the PyInstaller onedir layout, so the
+nix packaging is unchanged.
+
+All 180 vibe e2e cells re-verified green against 2.25.8 (zero failures,
+no retries); driver comments now cite 2.25.4–2.25.8 as the verified
+range.
