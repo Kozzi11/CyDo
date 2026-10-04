@@ -18,6 +18,7 @@ import cydo.agent.drivers.codex : CodexAgent, CodexSession,
 	NativeUndoExecutionResult, NativeUndoExecutionStatus, NativeUndoPlan,
 	ThreadForkOutcome,
 	countActiveFallbackRecordsFromBoundary;
+import cydo.agent.drivers.codex.rollout : resolveCodexFallbackUndoAnchor;
 import cydo.agent.session : AgentSession;
 import cydo.domain.storage.persistence : Persistence, createForkTask;
 import cydo.domain.task_types.definition : TaskTypeDef;
@@ -28,7 +29,7 @@ import cydo.domain.tasks.lifecycle : TaskNotificationChange;
 import cydo.protocol : HistoryBoundary, HistoryBoundaryKind;
 import cydo.workflow.history.jsonl_edit : replaceUserMessageContent;
 import cydo.workflow.history.operations : CodexForkSourceState, HistoryOperation,
-	HistoryOperationMechanism, allowsFileRevert, allowsOperation,
+	HistoryOperationMechanism, allowsFileRevert, allowsOperation, operationMechanism,
 	selectHistoryOperations;
 import cydo.workflow.history.jsonl_store : countLinesAfterForkId,
 	editJsonlMessage, forkTask, HistoryForkDestination, spliceJsonlByLine,
@@ -236,7 +237,7 @@ public:
 			return;
 		auto ta = source.agent;
 		HistoryBoundary boundary;
-		if (!host_.resolveFreshPersistedBoundary(tid, source, json.after_uuid, boundary))
+		if (!host_.resolveFreshPersistedBoundary(tid, source, json.anchor, boundary))
 		{
 			ws.send(Data(toJson(ErrorMessage("error",
 				"Fork failed: message UUID not found in task history", tid)).representation));
@@ -251,8 +252,7 @@ public:
 				"Fork failed: message UUID not found in task history", tid)).representation));
 			return;
 		}
-		auto mechanism = boundary.kind == HistoryBoundaryKind.user
-			? operations.fork.user : operations.fork.agent_turn;
+		auto mechanism = operationMechanism(boundary, operations, HistoryOperation.fork);
 		if (mechanism == HistoryOperationMechanism.codex_native)
 		{
 			auto ca = cast(CodexAgent) ta;
@@ -359,7 +359,7 @@ public:
 			return;
 		auto ta = access.agent;
 		HistoryBoundary boundary;
-		if (!host_.resolveFreshPersistedBoundary(tid, access, json.after_uuid, boundary))
+		if (!host_.resolveFreshPersistedBoundary(tid, access, json.anchor, boundary))
 		{
 			ws.send(Data(toJson(ErrorMessage("error", "UUID not found in task history", tid)).representation));
 			return;
@@ -371,8 +371,7 @@ public:
 			ws.send(Data(toJson(ErrorMessage("error", "UUID not found in task history", tid)).representation));
 			return;
 		}
-		auto mechanism = boundary.kind == HistoryBoundaryKind.user
-			? operations.undo.user : operations.undo.agent_turn;
+		auto mechanism = operationMechanism(boundary, operations, HistoryOperation.undo);
 		auto codexSession = cast(CodexSession) host_.sessionForTask(tid);
 		if (json.revert_files && !allowsFileRevert(boundary))
 		{
@@ -566,11 +565,30 @@ public:
 			return;
 		}
 
+		string truncationAnchor = boundary.anchor;
+		if (ta.driver == AgentDriver.codex && json.revert_conversation)
+		{
+			import std.file : readText;
+
+			// Resolve before backup/stop side effects; carry the result through the
+			// asynchronous fallback execution path unchanged.
+			truncationAnchor = resolveCodexFallbackUndoAnchor(readText(access.path),
+				boundary.kind == HistoryBoundaryKind.agent_turn
+					? PersistedHistoryBoundaryKind.agent_turn
+					: PersistedHistoryBoundaryKind.user, boundary.anchor);
+			if (truncationAnchor.length == 0)
+			{
+				ws.send(Data(toJson(ErrorMessage("error",
+					"UUID not found for truncation", tid)).representation));
+				return;
+			}
+		}
+
 		if (host_.taskAlive(tid))
 		{
 			auto liveLaunch = host_.requireLiveHistoryLaunch(tid, access);
 			fallbackUndoKillAndTruncate(ws, tid, json, boundary, mechanism, access,
-				liveLaunch);
+				liveLaunch, false, truncationAnchor);
 			return;
 		}
 
@@ -579,7 +597,8 @@ public:
 		performUndoExecution(ws, tid, json, boundary, mechanism, access,
 			ProcessLaunch.init, ta.driver == AgentDriver.codex
 			&& codexSourceState == CodexForkSourceState.dead
-			? UndoBackupDisposition.deadCodexNative : UndoBackupDisposition.generic);
+			? UndoBackupDisposition.deadCodexNative : UndoBackupDisposition.generic,
+			null, null, truncationAnchor);
 	}
 
 	void handleEditMessage(WebSocketAdapter ws, WsMessage json)
@@ -608,7 +627,7 @@ public:
 		auto ta = access.agent;
 		auto jsonlPath = access.path;
 		auto newContent = json.content.json !is null ? jsonParse!string(json.content.json) : "";
-		auto targetUuid = json.after_uuid;
+		auto targetUuid = json.anchor;
 		string fallbackUuid;
 		if (targetUuid.startsWith("enqueue-"))
 		{
@@ -1150,7 +1169,8 @@ private:
 
 	void fallbackUndoKillAndTruncate(MutationReplySocket ws, int tid, WsMessage json,
 		HistoryBoundary boundary, HistoryOperationMechanism mechanism,
-		HistoryAccess access, ProcessLaunch liveLaunch, bool backupMaterialized = false)
+		HistoryAccess access, ProcessLaunch liveLaunch, bool backupMaterialized = false,
+		string truncationAnchor = null)
 	{
 		auto td = host_.getTask(tid);
 		if (tid < 0 || td is null)
@@ -1176,7 +1196,7 @@ private:
 				assert(owner !is null);
 				auto continueUndo = () {
 					fallbackUndoKillAndTruncate(ws, tid, json, boundary, mechanism,
-						access, liveLaunch, true);
+						access, liveLaunch, true, truncationAnchor);
 				};
 				auto failUndo = (string message) {
 					ws.send(Data(toJson(ErrorMessage("error",
@@ -1252,7 +1272,7 @@ private:
 					performUndoExecution(ws, tid, json, boundary, mechanism, access,
 						liveLaunch, UndoBackupDisposition.alreadyMaterialized, (string message) {
 						failUndo(message);
-					}, () { transaction.finalize(); });
+					}, () { transaction.finalize(); }, truncationAnchor);
 				}
 				else
 					performUndoExecution(ws, tid, json, boundary, mechanism, access,
@@ -1288,7 +1308,8 @@ private:
 		HistoryBoundary boundary, HistoryOperationMechanism mechanism,
 		HistoryAccess access, ProcessLaunch capturedLiveLaunch,
 		UndoBackupDisposition backupDisposition,
-		void delegate(string) onFailure = null, void delegate() onSuccess = null)
+		void delegate(string) onFailure = null, void delegate() onSuccess = null,
+		string truncationAnchor = null)
 	{
 		import std.algorithm : canFind, startsWith;
 
@@ -1344,7 +1365,7 @@ private:
 				{
 					beginCodexJsonlUndoBackup(ws, tid, access, lastForkId, () {
 						finishUndoExecution(ws, tid, json, boundary, access,
-							rewindOutput, onFailure);
+							rewindOutput, onFailure, null, truncationAnchor);
 					});
 					return;
 				}
@@ -1394,12 +1415,14 @@ private:
 			}
 		}
 
-		finishUndoExecution(ws, tid, json, boundary, access, rewindOutput, onFailure, onSuccess);
+		finishUndoExecution(ws, tid, json, boundary, access, rewindOutput, onFailure,
+			onSuccess, truncationAnchor);
 	}
 
 	void finishUndoExecution(MutationReplySocket ws, int tid, WsMessage json,
 		HistoryBoundary boundary, HistoryAccess access, string rewindOutput,
-		void delegate(string) onFailure = null, void delegate() onSuccess = null)
+		void delegate(string) onFailure = null, void delegate() onSuccess = null,
+		string truncationAnchor = null)
 	{
 		auto td = host_.getTask(tid);
 		if (tid < 0 || td is null)
@@ -1409,7 +1432,9 @@ private:
 		if (json.revert_conversation)
 		{
 			auto histJsonlPath = access.path;
-			auto removed = truncateJsonl(histJsonlPath, boundary.anchor,
+			if (truncationAnchor.length == 0)
+				truncationAnchor = boundary.anchor;
+			auto removed = truncateJsonl(histJsonlPath, truncationAnchor,
 				&ta.forkIdMatchesLine, true);
 			if (removed < 0)
 			{
@@ -1474,6 +1499,23 @@ private:
 
 unittest
 {
+	// Browser history mutations accept the canonical boundary field only.  Keep
+	// this parser test here with the mutation entry points so a compatibility
+	// alias cannot silently reintroduce the retired wire name.
+	auto canonical = jsonParse!WsMessage(
+		`{"type":"undo_task","tid":71,"anchor":"line:2"}`);
+	assert(canonical.anchor == "line:2");
+
+	bool rejectedLegacyField;
+	try
+		jsonParse!WsMessage(`{"type":"undo_task","tid":71,"after_` ~ "uuid" ~ `":"line:2"}`);
+	catch (Exception)
+		rejectedLegacyField = true;
+	assert(rejectedLegacyField);
+}
+
+unittest
+{
 	import cydo.agent.drivers.claude : ClaudeCodeAgent;
 	import cydo.runtime.launch.types : NativeHistoryProfile;
 	import std.file : remove, write;
@@ -1526,7 +1568,7 @@ unittest
 	{
 		resolution = Resolution.forged;
 		service.handleUndoTaskMsg(reply, WsMessage(type: "undo_task", tid: tid,
-			after_uuid: "line:999999", dry_run: dryRun,
+			anchor: "line:999999", dry_run: dryRun,
 			revert_conversation: true));
 	}
 	assert(replies == 2);
@@ -1538,7 +1580,7 @@ unittest
 	{
 		resolution = Resolution.stale;
 		service.handleUndoTaskMsg(reply, WsMessage(type: "undo_task", tid: tid,
-			after_uuid: "line:4", dry_run: dryRun, revert_conversation: true));
+			anchor: "line:4", dry_run: dryRun, revert_conversation: true));
 	}
 	assert(replies == 4);
 	assert(sideEffects == 0);
@@ -1549,7 +1591,7 @@ unittest
 	{
 		resolution = Resolution.noCheckpoint;
 		service.handleUndoTaskMsg(reply, WsMessage(type: "undo_task", tid: tid,
-			after_uuid: "assistant", dry_run: dryRun, revert_conversation: true,
+			anchor: "assistant", dry_run: dryRun, revert_conversation: true,
 			revert_files: true));
 	}
 	assert(replies == 6);
@@ -1637,8 +1679,12 @@ unittest
 	int reloadCalls;
 	int watchCalls;
 	int updateCalls;
+	int backupCalls;
+	int stopCalls;
+	int liveLaunchCalls;
 	int boundaryCalls;
 	int historyAccessCalls;
+	bool fallbackAnchorMatrix;
 	CodexForkSourceState selectedSourceState;
 	enum rolloutPath = "/tmp/cydo-native-undo-unittest.jsonl";
 	if (exists(rolloutPath))
@@ -1666,8 +1712,14 @@ unittest
 	host.resolveFreshPersistedBoundary = (int, const ref HistoryAccess,
 		string, out HistoryBoundary boundary) {
 		boundaryCalls++;
-		boundary = HistoryBoundary("line:2", HistoryBoundaryKind.user, null);
+		boundary = fallbackAnchorMatrix
+			? HistoryBoundary("line:3", HistoryBoundaryKind.agent_turn, null)
+			: HistoryBoundary("line:2", HistoryBoundaryKind.user, null);
 		return true;
+	};
+	host.requireLiveHistoryLaunch = (int, const ref HistoryAccess) {
+		liveLaunchCalls++;
+		return ProcessLaunch.init;
 	};
 	host.invalidateJsonlLineage = (int) { lineageCalls++; };
 	host.clearUndoJsonl = (int) { clearCalls++; };
@@ -1675,24 +1727,28 @@ unittest
 	host.emitTaskReload = (int, string) { reloadCalls++; };
 	host.startJsonlWatch = (int) { watchCalls++; };
 	host.broadcastTaskUpdate = (int) { updateCalls++; };
-	host.stopTask = (int) { assert(false); };
+	host.stopTask = (int) { stopCalls++; };
 	host.getUndoJsonl = (int) { assert(false); return null; };
 
-	auto service = new TaskMutationService(host);
+	auto service = new TaskMutationService(host,
+		(MutationReplySocket, int, HistoryAccess, string, CodexSession,
+			void delegate(), void delegate(string)) { backupCalls++; });
 	void delegate(Data) reply = (Data data) {
 		replies ~= cast(string) data.toGC();
 	};
 	WsMessage previewRequest() => WsMessage(type: "undo_task", tid: tid,
-		after_uuid: "line:2", dry_run: true, revert_conversation: true);
+		anchor: "line:2", dry_run: true, revert_conversation: true);
 	WsMessage nativeConfirmation(uint expected) => jsonParse!WsMessage(
-		`{"type":"undo_task","tid":72,"after_uuid":"line:2","expected_num_turns":`
+		`{"type":"undo_task","tid":72,"anchor":"line:2","expected_num_turns":`
 		~ expected.to!string ~ `}`);
 	void resetEffects()
 	{
 		replies = null;
 		lineageCalls = clearCalls = unsubscribeCalls = reloadCalls = watchCalls = updateCalls = 0;
+		backupCalls = stopCalls = liveLaunchCalls = 0;
 		boundaryCalls = 0;
 		historyAccessCalls = 0;
+		fallbackAnchorMatrix = false;
 		selectedSourceState = CodexForkSourceState.dead;
 		session.prepareCalls = session.executeCalls = 0;
 		session.rejectPreparation = false;
@@ -1741,7 +1797,7 @@ unittest
 	// A native confirmation without an echoed count does not prepare or mutate.
 	resetEffects();
 	service.handleUndoTaskMsg(reply, WsMessage(type: "undo_task", tid: tid,
-		after_uuid: "line:2"));
+		anchor: "line:2"));
 	assert(session.prepareCalls == 0 && session.executeCalls == 0 && lineageCalls == 0
 		&& clearCalls == 0 && unsubscribeCalls == 0 && reloadCalls == 0
 		&& watchCalls == 0 && updateCalls == 0
@@ -1867,6 +1923,40 @@ unittest
 		&& session.prepareCalls == 0 && session.executeCalls == 0 && replies.length == 1
 		&& replies[0].canFind(`"messages_removed":2`)
 		&& replies[0].canFind(`"count_unit":"history_entries"`));
+
+	struct FallbackAnchorFailureCase
+	{
+		string name;
+		string rollout;
+	}
+	foreach (failureCase; [
+		FallbackAnchorFailureCase("missing", `{"type":"event_msg","payload":{"type":"task_started"}}` ~ "\n"
+			~ `{"type":"event_msg","payload":{"type":"task_started"}}` ~ "\n"
+			~ `{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"selected"}]}}`),
+		FallbackAnchorFailureCase("malformed", `{"type":"event_msg","payload":{"type":"agent_message","message":[]}}` ~ "\n"
+			~ `{"type":"event_msg","payload":{"type":"task_started"}}` ~ "\n"
+			~ `{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"selected"}]}}`),
+		FallbackAnchorFailureCase("ambiguous", `{"type":"event_msg","payload":{"type":"agent_message","message":"selected","phase":null,"memory_citation":null}}` ~ "\n"
+			~ `{"type":"event_msg","payload":{"type":"agent_message","message":"selected","phase":null,"memory_citation":null}}` ~ "\n"
+			~ `{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"selected"}]}}`),
+	])
+	{
+		resetEffects();
+		fallbackAnchorMatrix = true;
+		session.rollbackAvailable = false;
+		write(rolloutPath, failureCase.rollout);
+		auto before = readText(rolloutPath);
+		service.handleUndoTaskMsg(reply, WsMessage(type: "undo_task", tid: tid,
+		anchor: "line:3", dry_run: false, revert_conversation: true));
+		assert(selectedSourceState == CodexForkSourceState.liveBusy
+			&& liveLaunchCalls == 0 && backupCalls == 0 && stopCalls == 0
+			&& lineageCalls == 0 && clearCalls == 0 && unsubscribeCalls == 0
+			&& reloadCalls == 0 && watchCalls == 0 && updateCalls == 0
+			&& session.prepareCalls == 0 && session.executeCalls == 0
+			&& taskIsAlive && !task.undoStopInProgress
+			&& replies.length == 1 && replies[0].canFind("UUID not found for truncation")
+			&& readText(rolloutPath) == before, failureCase.name);
+	}
 
 	// Once stopped, a fresh JSONL preview uses the dead-source policy and never
 	// carries the native ledger count unit.

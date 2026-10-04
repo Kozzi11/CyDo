@@ -70,33 +70,32 @@ test(
 
     const rollbackFrames = () => frames.slice(rollbackFrameStart);
     await expect
-      .poll(
-        () => {
-          const reloads = rollbackFrames().filter(
-            (frame) => frame?.type === "task_reload",
-          );
-          const reloadIdx = rollbackFrames().findIndex(
-            (frame) => frame?.type === "task_reload",
-          );
-          const historyStartIdx = rollbackFrames().findIndex(
-            (frame, idx) =>
-              idx > reloadIdx && frame?.type === "task_history_start",
-          );
-          const historyEndIdx = rollbackFrames().findIndex(
-            (frame, idx) =>
-              idx > historyStartIdx && frame?.type === "task_history_end",
-          );
-          return (
-            reloads.length === 1 &&
-            historyStartIdx > reloadIdx &&
-            historyEndIdx > historyStartIdx
-          );
-        },
-      )
+      .poll(() => {
+        const reloads = rollbackFrames().filter(
+          (frame) => frame?.type === "task_reload",
+        );
+        const reloadIdx = rollbackFrames().findIndex(
+          (frame) => frame?.type === "task_reload",
+        );
+        const historyStartIdx = rollbackFrames().findIndex(
+          (frame, idx) =>
+            idx > reloadIdx && frame?.type === "task_history_start",
+        );
+        const historyEndIdx = rollbackFrames().findIndex(
+          (frame, idx) =>
+            idx > historyStartIdx && frame?.type === "task_history_end",
+        );
+        return (
+          reloads.length === 1 &&
+          historyStartIdx > reloadIdx &&
+          historyEndIdx > historyStartIdx
+        );
+      })
       .toBe(true);
     const backups = rollbackFrames().filter(
       (frame) =>
-        frame?.type === "task_created" && frame?.relation_type === "undo-backup",
+        frame?.type === "task_created" &&
+        frame?.relation_type === "undo-backup",
     );
     expect(backups).toHaveLength(1);
     expect(backups[0].parent_tid).toBe(tid);
@@ -127,7 +126,9 @@ test(
     await expect(backup).toBeVisible();
     await backup.click();
     await expect(assistantText(page, "second-reply")).toBeVisible();
-    await expect(page.locator(".user-message", { hasText: "stall session" })).toHaveCount(0);
+    await expect(
+      page.locator(".user-message", { hasText: "stall session" }),
+    ).toHaveCount(0);
     await page.locator(`.sidebar-item[data-tid="${tid}"]`).click();
 
     // Verify the session auto-resumed (input box visible).
@@ -138,5 +139,63 @@ test(
     await expect
       .poll(() => JSON.stringify(codexRolloutRecords(tid)))
       .toContain("third-reply");
+    await enterSession(page);
+    await sendMessage(page, 'Please reply with "assistant-busy-prefix"');
+    await expect(assistantText(page, "assistant-busy-prefix")).toBeVisible();
+    await sendMessage(page, 'Please reply with "assistant-busy-selected"');
+    await expect(assistantText(page, "assistant-busy-selected")).toBeVisible();
+    const assistantTid = currentTaskTid(page);
+    await sendMessage(page, "stall session");
+    await expect(page.locator(".btn-banner-stop")).toBeVisible();
+    const selectedAssistant = page
+      .locator(".message-wrapper", {
+        has: page.locator(".assistant-message", {
+          hasText: "assistant-busy-selected",
+        }),
+      })
+      .last();
+    await selectedAssistant.hover();
+    await selectedAssistant.locator(".undo-btn").click();
+    await expect(page.locator(".undo-dialog")).toBeVisible();
+    await page.locator(".btn-undo").click();
+    await expect(assistantText(page, "assistant-busy-selected")).toHaveCount(0);
+    await expect(
+      page.locator(".user-message:not(.pending)", { hasText: "stall session" }),
+    ).toHaveCount(0);
+    await expect(
+      page.locator(".user-message:not(.pending)", {
+        hasText: "assistant-busy-selected",
+      }),
+    ).toBeVisible();
+    await expect
+      .poll(() =>
+        codexRolloutRecords(assistantTid).some(
+          (record) =>
+            record.type === "event_msg" &&
+            record.payload?.type === "agent_message" &&
+            record.payload?.message === "assistant-busy-selected",
+        ),
+      )
+      .toBe(false);
+    await page.reload();
+    await expect(assistantText(page, "assistant-busy-prefix")).toBeVisible();
+    await expect(assistantText(page, "assistant-busy-selected")).toHaveCount(0);
+    await expect(page.locator(".input-textarea:visible").first()).toBeEnabled();
+    await sendMessage(page, 'Please reply with "assistant-busy-follow-up"');
+    await expect(assistantText(page, "assistant-busy-follow-up")).toBeVisible();
+    await enterSession(page);
+    await sendMessage(page, 'Please reply with "assistant-ready-unsupported"');
+    await expect(
+      assistantText(page, "assistant-ready-unsupported"),
+    ).toBeVisible();
+    const readyAssistant = page
+      .locator(".message-wrapper", {
+        has: page.locator(".assistant-message", {
+          hasText: "assistant-ready-unsupported",
+        }),
+      })
+      .last();
+    await readyAssistant.hover();
+    await expect(readyAssistant.locator(".undo-btn")).toHaveCount(0);
   },
 );

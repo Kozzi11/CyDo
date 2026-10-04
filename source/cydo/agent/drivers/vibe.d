@@ -263,6 +263,10 @@ private interface VibeSessionHandler
 	void handleStderr(string line);
 	void handleStartupFailure(Exception error);
 	void handleExit(int status);
+
+	// A fault contained by AgentProcess while running a stdout/stderr
+	// line handler (mirrors the Claude driver's reportLineHandlerError).
+	void handleLineHandlerError(string source, Exception e);
 }
 
 // ---------------------------------------------------------------------------
@@ -356,6 +360,17 @@ class VibeAcpProcess
 				import std.stdio : stderr;
 				stderr.writeln("[vibe/pre-session-stderr] " ~ line);
 			}
+		};
+
+		// A fault escaping a stdout/stderr line handler is contained by
+		// AgentProcess; surface it as a task diagnostic on the sessions
+		// this process serves instead of unwinding the event loop (one
+		// process serves one task's session, so the routing is exact).
+		process.onLineHandlerError = (string source, Exception e) {
+			if (pendingSession !is null)
+				pendingSession.handleLineHandlerError(source, e);
+			foreach (session; sessions)
+				session.handleLineHandlerError(source, e);
 		};
 
 		process.onExit = (int status) {
@@ -2103,8 +2118,14 @@ class VibeSession : AgentSession, VibeSessionHandler
 
 	// ----- AgentSession interface -----
 
+	// nativeSubmissionUuid is accepted for AgentSession interface
+	// compatibility but unused: the Claude-native submission UUID registry
+	// has no vibe analogue (a submission's identity is its session/prompt
+	// JSON-RPC request id, and the server only supplies the UUID for
+	// Claude-driver tasks anyway).
 	Promise!AgentSubmissionReceipt sendMessage(const(ContentBlock)[] content,
-		string correlationId = null, bool isContextBootstrap = false)
+		string correlationId = null, bool isContextBootstrap = false,
+		string nativeSubmissionUuid = null)
 	{
 		// Extract text for the echo-correlation state (image blocks ride
 		// along in content; only text feeds the echo matcher).
@@ -2275,6 +2296,21 @@ class VibeSession : AgentSession, VibeSessionHandler
 	{
 		if (stderrHandler_)
 			stderrHandler_(line);
+	}
+
+	// Surface a contained line-handler fault on the task it belongs to.
+	// The session keeps running: the agent process is unaffected by CyDo
+	// failing to translate one of its lines, and the rest of the turn is
+	// still worth showing.
+	void handleLineHandlerError(string source, Exception e)
+	{
+		import cydo.protocol : TaskDiagnosticEvent, TaskDiagnosticSeverity;
+
+		TaskDiagnosticEvent ev;
+		ev.severity = TaskDiagnosticSeverity.error;
+		ev.subject = "CyDo error";
+		ev.body = "Failed to process agent " ~ source ~ ": " ~ e.msg;
+		emitEvent(toJson(ev), null);
 	}
 
 	void handleStartupFailure(Exception error)
@@ -3491,6 +3527,41 @@ unittest
 	connection.respond(promptRequest, acceptedVibeResponse(
 		`{"stopReason":"end_turn","usage":{"input_tokens":5,"output_tokens":5}}`));
 	drainVibePromiseNextTicks();
+}
+
+unittest
+{
+	// A line-handler fault contained by AgentProcess reaches the session
+	// as a task diagnostic and keeps the session alive (mirrors the
+	// Claude driver's reportLineHandlerError wiring).
+	import std.algorithm : canFind;
+
+	auto connection = new TestVibeConnection;
+	auto server = makeTestVibeAcpProcess(connection);
+	auto session = attachSession(server, 1, null, "test-model", "/test/workdir",
+		SessionConfig.init);
+	assert(session.alive);
+	string[] emitted;
+	session.onOutput = (TranslatedEvent event) {
+		emitted ~= event.translated;
+	};
+
+	session.handleLineHandlerError("stdout", new Exception("bad line"));
+
+	assert(emitted.length == 1);
+	@JSONPartial static struct DiagnosticProbe
+	{
+		string type;
+		string severity;
+		string subject;
+		string body;
+	}
+	auto probe = jsonParse!DiagnosticProbe(emitted[0]);
+	assert(probe.type == "cydo/task_diagnostic");
+	assert(probe.severity == "error");
+	assert(probe.subject == "CyDo error");
+	assert(probe.body.canFind("stdout") && probe.body.canFind("bad line"));
+	assert(session.alive);
 }
 
 unittest

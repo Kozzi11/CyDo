@@ -35,8 +35,8 @@ interface Props {
   blocks: Map<string, Block>;
   isProcessing: boolean;
   bandStatus: string;
-  onFork?: (sid: number, afterUuid: string) => void;
-  onUndo?: (tid: number, afterUuid: string) => void;
+  onFork?: (sid: number, anchor: string) => void;
+  onUndo?: (tid: number, anchor: string) => void;
   onEditMessage?: (tid: number, uuid: string, content: string) => void;
   onEditRawEvent?: (tid: number, seq: number, content: string) => void;
   onViewFile?: (filePath: string) => void;
@@ -524,12 +524,15 @@ const MessageView = memo(
     childrenByParent: Map<string, DisplayMessage[]>;
     resolvedBlocksByMsg: Map<string, Block[]>;
     onViewFile?: (filePath: string) => void;
-    onFork?: (afterUuid: string) => void;
-    onUndo?: (afterUuid: string) => void;
+    onFork?: (anchor: string) => void;
+    onUndo?: (anchor: string) => void;
     onEdit?: (uuid: string, content: string) => void;
     onEditRaw?: (seq: number, content: string) => void;
     actionUuid?: string;
-    actionBoundary?: { kind: "user" | "agent_turn"; checkpointUuid?: string };
+    actionBoundary?: {
+      kind: "user" | "provisional_user" | "agent_turn";
+      checkpointUuid?: string;
+    };
     spawnedTidsByItemId?: Map<string, Map<number, number>>;
     getTaskHref?: (id: string) => string;
   }) {
@@ -570,6 +573,11 @@ const MessageView = memo(
             .map((b) => b.text)
             .join("\n")
         : "";
+    const undoLabel = `${
+      actionBoundary?.kind === "agent_turn"
+        ? "Undo this response and later history, retaining its prompt"
+        : "Undo this message and later history, restoring its prompt to the composer"
+    }${actionBoundary?.checkpointUuid ? " (file checkpoint available)" : ""}`;
 
     if (msg.subtype === "metadata" && !devMode) return null;
 
@@ -733,6 +741,25 @@ const MessageView = memo(
               />
             </button>
           )}
+          {uuid && onUndo && (
+            <button
+              class="msg-action-btn undo-btn"
+              onClick={() => {
+                onUndo(uuid);
+              }}
+              aria-label={undoLabel}
+              title={undoLabel}
+            >
+              <span
+                class="action-icon"
+                dangerouslySetInnerHTML={{
+                  __html: actionBoundary?.checkpointUuid
+                    ? undoFileRevertIcon
+                    : undoIcon,
+                }}
+              />
+            </button>
+          )}
         </div>
         {editing ? (
           <div class="message user-message editing">
@@ -771,60 +798,23 @@ const MessageView = memo(
         ) : (
           inner
         )}
-        {uuid && (onFork || onUndo) && (
+        {uuid && onFork && (
           <div class="message-actions message-actions-bottom">
-            {onFork && (
-              <button
-                class="msg-action-btn fork-btn"
-                data-fork-tid={tid}
-                data-fork-anchor={uuid}
-                onClick={() => {
-                  onFork(uuid);
-                }}
-                title="Fork session after this point"
-                aria-label="Fork session after this point"
-              >
-                <span
-                  class="action-icon"
-                  dangerouslySetInnerHTML={{ __html: forkIcon }}
-                />
-              </button>
-            )}
-            {onUndo && (
-              <button
-                class="msg-action-btn undo-btn"
-                onClick={() => {
-                  onUndo(uuid);
-                }}
-                aria-label={
-                  actionBoundary?.kind === "agent_turn"
-                    ? actionBoundary.checkpointUuid
-                      ? "Undo this response and later history, retaining its prompt (file checkpoint available)"
-                      : "Undo this response and later history, retaining its prompt"
-                    : actionBoundary?.checkpointUuid
-                      ? "Undo to this point (file checkpoint available)"
-                      : "Undo to this point"
-                }
-                title={
-                  actionBoundary?.kind === "agent_turn"
-                    ? actionBoundary.checkpointUuid
-                      ? "Undo this response and later history, retaining its prompt (file checkpoint available)"
-                      : "Undo this response and later history, retaining its prompt"
-                    : actionBoundary?.checkpointUuid
-                      ? "Undo to this point (file checkpoint available)"
-                      : "Undo to this point"
-                }
-              >
-                <span
-                  class="action-icon"
-                  dangerouslySetInnerHTML={{
-                    __html: actionBoundary?.checkpointUuid
-                      ? undoFileRevertIcon
-                      : undoIcon,
-                  }}
-                />
-              </button>
-            )}
+            <button
+              class="msg-action-btn fork-btn"
+              data-fork-tid={tid}
+              data-fork-anchor={uuid}
+              onClick={() => {
+                onFork(uuid);
+              }}
+              title="Fork session after this point"
+              aria-label="Fork session after this point"
+            >
+              <span
+                class="action-icon"
+                dangerouslySetInnerHTML={{ __html: forkIcon }}
+              />
+            </button>
           </div>
         )}
       </div>
@@ -902,8 +892,8 @@ export function MessageList({
   const handleFork = useMemo(
     () =>
       onFork
-        ? (afterUuid: string) => {
-            onFork(taskTid, afterUuid);
+        ? (anchor: string) => {
+            onFork(taskTid, anchor);
           }
         : undefined,
     [onFork, taskTid],
@@ -911,8 +901,8 @@ export function MessageList({
   const handleUndo = useMemo(
     () =>
       onUndo
-        ? (afterUuid: string) => {
-            onUndo(taskTid, afterUuid);
+        ? (anchor: string) => {
+            onUndo(taskTid, anchor);
           }
         : undefined,
     [onUndo, taskTid],
@@ -1083,7 +1073,7 @@ export function MessageList({
                     boundaries[0] as {
                       history_boundary: {
                         anchor: string;
-                        kind: "user" | "agent_turn";
+                        kind: "user" | "provisional_user" | "agent_turn";
                         checkpoint_uuid?: string;
                       };
                     }

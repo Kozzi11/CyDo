@@ -17,6 +17,53 @@ test(
     const secondContent = "selected checkpoint state";
     const thirdContent = "third checkpoint state";
     const fourthContent = "conversation only state";
+    const liveFile = `${backend.wsDir}/undo-live-revert-test.txt`;
+    const livePrevious = "live predecessor state";
+    const liveSelected = "live selected state";
+
+    await enterSession(page);
+    await sendMessage(
+      page,
+      `create file ${liveFile} with content ${livePrevious}`,
+    );
+    await expect(assistantText(page, "Done.")).toBeVisible();
+    await sendMessage(
+      page,
+      `create file ${liveFile} with content ${liveSelected}`,
+    );
+    await expect(assistantText(page, "Done.")).toHaveCount(2);
+    const liveCheckpointUser = page
+      .locator(".message-wrapper", {
+        has: page.locator(".user-message", { hasText: liveSelected }),
+      })
+      .last();
+    await liveCheckpointUser.hover();
+    const liveUndo = liveCheckpointUser.locator(".undo-btn");
+    await expect(liveUndo).toHaveAttribute(
+      "title",
+      "Undo this message and later history, restoring its prompt to the composer (file checkpoint available)",
+    );
+    await liveUndo.click();
+    const dialog = page.locator(".undo-dialog");
+    await expect(dialog).toBeVisible();
+    const revertConversation = dialog.getByLabel("Revert conversation history");
+    const revertFiles = dialog.getByLabel("Revert file changes");
+    await revertConversation.uncheck();
+    await expect(revertFiles).toBeEnabled();
+    await expect(revertFiles).toBeChecked();
+    await dialog.locator(".btn-undo").click();
+    await expect(page.locator(".undo-result-banner")).toBeVisible();
+    expect(readFileSync(liveFile, "utf8").trimEnd()).toBe(livePrevious);
+    await expect(
+      page.locator(".message.user-message:not(.pending)", {
+        hasText: liveSelected,
+      }),
+    ).toBeVisible();
+    await expect(assistantText(page, "Done.")).toHaveCount(2);
+    await sendMessage(page, 'Please reply with "live-file-revert-follow-up"');
+    await expect(
+      assistantText(page, "live-file-revert-follow-up"),
+    ).toBeVisible();
 
     await enterSession(page);
     await sendMessage(
@@ -67,13 +114,40 @@ test(
     const thirdUndoButton = thirdCheckpointUser.locator(".undo-btn");
     await expect(thirdUndoButton).toHaveAttribute(
       "title",
-      "Undo to this point (file checkpoint available)",
+      "Undo this message and later history, restoring its prompt to the composer (file checkpoint available)",
     );
     const thirdForkButton = thirdCheckpointUser.locator(".fork-btn");
     await thirdCheckpointUser.hover();
+    await expect(thirdUndoButton.locator("xpath=..")).toHaveClass(
+      "message-actions",
+    );
+    await expect(thirdForkButton.locator("xpath=..")).toHaveClass(
+      /message-actions-bottom/,
+    );
+    const thirdMessageBox = await thirdCheckpointUser
+      .locator(".user-message")
+      .boundingBox();
+    const thirdUndoBox = await thirdUndoButton.boundingBox();
+    const thirdForkBox = await thirdForkButton.boundingBox();
+    expect(thirdMessageBox).not.toBeNull();
+    expect(thirdUndoBox).not.toBeNull();
+    expect(thirdForkBox).not.toBeNull();
+    expect(
+      Math.abs(thirdUndoBox!.y + thirdUndoBox!.height / 2 - thirdMessageBox!.y),
+    ).toBeLessThanOrEqual(2);
+    expect(
+      Math.abs(
+        thirdForkBox!.y +
+          thirdForkBox!.height / 2 -
+          (thirdMessageBox!.y + thirdMessageBox!.height),
+      ),
+    ).toBeLessThanOrEqual(2);
+    expect(thirdUndoBox!.y + thirdUndoBox!.height).toBeLessThanOrEqual(
+      thirdForkBox!.y,
+    );
     await expect(thirdForkButton).toBeVisible();
     await thirdForkButton.focus();
-    await page.keyboard.press("Tab");
+    await page.keyboard.press("Shift+Tab");
     await expect(thirdUndoButton).toBeFocused();
     await expect(thirdUndoButton).toBeVisible();
     await thirdUndoButton.press("Enter");
@@ -104,13 +178,42 @@ test(
     const secondUndoButton = secondCheckpointUser.locator(".undo-btn");
     await expect(secondUndoButton).toHaveAttribute(
       "title",
-      "Undo to this point (file checkpoint available)",
+      "Undo this message and later history, restoring its prompt to the composer (file checkpoint available)",
     );
     const secondForkButton = secondCheckpointUser.locator(".fork-btn");
     await secondCheckpointUser.hover();
+    await expect(secondUndoButton.locator("xpath=..")).toHaveClass(
+      "message-actions",
+    );
+    await expect(secondForkButton.locator("xpath=..")).toHaveClass(
+      /message-actions-bottom/,
+    );
+    const secondMessageBox = await secondCheckpointUser
+      .locator(".user-message")
+      .boundingBox();
+    const secondUndoBox = await secondUndoButton.boundingBox();
+    const secondForkBox = await secondForkButton.boundingBox();
+    expect(secondMessageBox).not.toBeNull();
+    expect(secondUndoBox).not.toBeNull();
+    expect(secondForkBox).not.toBeNull();
+    expect(
+      Math.abs(
+        secondUndoBox!.y + secondUndoBox!.height / 2 - secondMessageBox!.y,
+      ),
+    ).toBeLessThanOrEqual(2);
+    expect(
+      Math.abs(
+        secondForkBox!.y +
+          secondForkBox!.height / 2 -
+          (secondMessageBox!.y + secondMessageBox!.height),
+      ),
+    ).toBeLessThanOrEqual(2);
+    expect(secondUndoBox!.y + secondUndoBox!.height).toBeLessThanOrEqual(
+      secondForkBox!.y,
+    );
     await expect(secondForkButton).toBeVisible();
     await secondForkButton.focus();
-    await page.keyboard.press("Tab");
+    await page.keyboard.press("Shift+Tab");
     await expect(secondUndoButton).toBeFocused();
     await expect(secondUndoButton).toBeVisible();
     await secondUndoButton.press("Enter");

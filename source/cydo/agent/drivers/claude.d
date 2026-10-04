@@ -114,15 +114,7 @@ class ClaudeCodeAgent : Agent
 		return new ClaudeCodeSession(claudeBin, resumeSessionId, launch.cmdPrefix,
 			lastMcpConfigPath_, config,
 			(string sessionId, string cwd) {
-				import std.path : buildPath;
-				// The init event's cwd is the CLI's own observed CWD — the
-				// one Claude mangles into its project directory name.
-				enforce(cwd.length > 0,
-					"Claude session initialization did not provide a CWD");
-				registerHistoryPath(sessionId,
-					buildPath(profile.root, "projects", mangleProjectPath(cwd),
-						sessionId ~ ".jsonl"),
-					profile);
+				registerLiveHistoryPath(sessionId, cwd, profile);
 			});
 	}
 
@@ -443,6 +435,60 @@ class ClaudeCodeAgent : Agent
 		registeredHistoryPaths_[profile.root][sessionId] = path;
 	}
 
+	/// Bind a live session to its history file, given the CWD its init event
+	/// reported.
+	///
+	/// Claude names a project directory after the CLI process's own observed
+	/// CWD, so that CWD locates the transcript of a session Claude is
+	/// *creating*. It does not locate the transcript of one that already
+	/// exists — Claude keeps appending to the file it has, wherever that is,
+	/// and merely materializes an empty project directory for the new name.
+	/// The two disagree in two ways seen in practice:
+	///
+	/// - the session CWD moves under a running process (a `cd` in a Bash tool
+	///   call), and Claude re-announces it in a fresh init event on a later
+	///   turn of that same process;
+	/// - a process resumes a session somewhere other than where it was
+	///   created, because the project directory moved or its CWD is respelled
+	///   across sandbox changes.
+	///
+	/// The derived location is therefore a candidate, never an authority.
+	private void registerLiveHistoryPath(string sessionId, string cwd,
+		const ref NativeHistoryProfile profile)
+	{
+		import std.logger : tracef;
+		import std.path : buildPath;
+		enforce(cwd.length > 0,
+			"Claude session initialization did not provide a CWD");
+		auto derived = buildPath(profile.root, "projects", mangleProjectPath(cwd),
+			sessionId ~ ".jsonl");
+		auto chosen = preferExistingHistoryPath(derived,
+			historyPath(sessionId, profile));
+		if (chosen != derived)
+			tracef("Claude session %s reported CWD %s; keeping its history at %s "
+				~ "rather than the CWD-derived %s", sessionId, cwd, chosen, derived);
+		registeredHistoryPaths_[profile.root][sessionId] = chosen;
+	}
+
+	/// Choose between a CWD-derived candidate and a location CyDo already
+	/// knows. A file that exists beats one that does not; when both exist the
+	/// newest wins, the same way the profile scan resolves a session ID that
+	/// appears in two project directories. When neither exists the known path
+	/// wins: it was learned first-hand (a fork destination, an imported
+	/// locator, an earlier init of this same session), while the candidate is
+	/// only a guess about where a file is about to appear.
+	private static string preferExistingHistoryPath(string derived, string known)
+	{
+		import std.file : exists, timeLastModified;
+		if (known.length == 0 || known == derived)
+			return derived;
+		auto derivedExists = exists(derived);
+		if (derivedExists && exists(known))
+			return timeLastModified(derived) >= timeLastModified(known)
+				? derived : known;
+		return derivedExists ? derived : known;
+	}
+
 	string createHistoryForkDestination(string sessionId, string sourceHistoryPath,
 		const ref NativeHistoryProfile profile)
 	{
@@ -518,6 +564,67 @@ class ClaudeCodeAgent : Agent
 		assert(agent.historyPath(idC, profile) == destination);
 	}
 
+	// A live session's init CWD locates a new session's transcript, but not
+	// an existing one's: Claude keeps appending to the file it already has
+	// and leaves the CWD-derived project directory empty, whether the CWD
+	// moved under the running process or the session resumed elsewhere.
+	unittest
+	{
+		import std.datetime.systime : SysTime;
+		import std.file : exists, mkdirRecurse, rmdirRecurse, setTimes, write;
+		import std.path : buildPath;
+
+		auto root = buildPath("/tmp", "cydo-claude-live-history-path");
+		if (exists(root))
+			rmdirRecurse(root);
+		scope (exit)
+			if (exists(root))
+				rmdirRecurse(root);
+		enum created = "/home/user/proj";
+		enum resumed = "/home/user/proj-moved";
+		auto createdDir = buildPath(root, "projects", "-home-user-proj");
+		auto resumedDir = buildPath(root, "projects", "-home-user-proj-moved");
+		mkdirRecurse(createdDir);
+		mkdirRecurse(resumedDir);  // Claude materializes it, empty
+		enum idA = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+		enum idB = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
+		auto agent = new ClaudeCodeAgent();
+		auto profile = NativeHistoryProfile(AgentDriver.claude, root);
+		auto createdPath = buildPath(createdDir, idA ~ ".jsonl");
+
+		// 23. a session Claude is creating has no transcript yet, so the
+		// CWD-derived location is all there is to go on
+		agent.registerLiveHistoryPath(idA, created, profile);
+		assert(agent.historyPath(idA, profile) == createdPath);
+
+		// 24. a later init naming a different CWD — the session moved, or it
+		// resumed elsewhere — keeps the transcript Claude is actually
+		// writing, rather than the empty directory that CWD names
+		write(createdPath, "");
+		agent.registerLiveHistoryPath(idA, resumed, profile);
+		assert(agent.historyPath(idA, profile) == createdPath);
+
+		// 25. repeating that init is stable, and never throws the way a plain
+		// re-registration of a conflicting path does
+		agent.registerLiveHistoryPath(idA, resumed, profile);
+		assert(agent.historyPath(idA, profile) == createdPath);
+
+		// 26. when both locations hold a transcript the newest wins, matching
+		// how the profile scan resolves a session ID in two directories
+		auto stale = buildPath(createdDir, idB ~ ".jsonl");
+		auto fresh = buildPath(resumedDir, idB ~ ".jsonl");
+		write(stale, "");
+		write(fresh, "");
+		auto older = SysTime.fromUnixTime(1_000_000);
+		auto newer = SysTime.fromUnixTime(2_000_000);
+		setTimes(stale, older, older);
+		setTimes(fresh, newer, newer);
+		agent.registerHistoryPath(idB, stale, profile);
+		agent.registerLiveHistoryPath(idB, resumed, profile);
+		assert(agent.historyPath(idB, profile) == fresh);
+	}
+
 	TranslatedEvent[] translateHistoryLine(string line, int lineNum)
 	{
 		return translateClaudeHistoryEvent(line);
@@ -580,13 +687,15 @@ class ClaudeCodeAgent : Agent
 				{
 					auto qop = jsonParse!QueueOpProbe(line);
 					if (qop.operation == "enqueue")
-						ids ~= PersistedHistoryBoundary(format!"enqueue-%d"(lineNum), PersistedHistoryBoundaryKind.user, null, lineNum);
+						ids ~= PersistedHistoryBoundary(format!"enqueue-%d"(lineNum), PersistedHistoryBoundaryKind.provisional_user, null, lineNum);
 				}
 				catch (Exception e) { tracef("history scan: queue op parse error: %s", e.msg); }
 				continue;
 			}
 			bool isUser = line.canFind(`"type":"user"`);
 			if (!isUser && !line.canFind(`"type":"assistant"`))
+				continue;
+			if (isUser && !hasCanonicalUserContent(line))
 				continue;
 			enum prefix = `"uuid":"`;
 			auto idx = line.indexOf(prefix);
@@ -610,6 +719,36 @@ class ClaudeCodeAgent : Agent
 					null, lineNum);
 		}
 		return ids;
+	}
+
+	private static bool hasCanonicalUserContent(string line)
+	{
+		@JSONPartial static struct UserMessage { JSONFragment content; }
+		@JSONPartial static struct UserRecord { UserMessage message; }
+		UserRecord record;
+		try
+			record = jsonParse!UserRecord(line);
+		catch (Exception)
+			return false;
+
+		auto content = record.message.content.json;
+		if (content is null || content.length == 0)
+			return false;
+		if (content[0] == '"')
+			return true;
+		if (content[0] != '[')
+			return false;
+
+		@JSONPartial static struct ContentItem { string type; }
+		ContentItem[] items;
+		try
+			items = jsonParse!(ContentItem[])(content);
+		catch (Exception)
+			return false;
+		foreach (item; items)
+			if (item.type == "text" || item.type == "image")
+				return true;
+		return false;
 	}
 
 	InterruptedToolCallRepair repairInterruptedToolCall(string[] lines, string toolName,
@@ -885,6 +1024,7 @@ InterruptedToolCallRepair repairInterruptedToolCallImpl(string[] lines, string t
 		return null;
 
 	string resultUuid;
+	string resultPromptId;
 	bool rewroteResult;
 	string[] rewritten;
 	foreach (line; lines)
@@ -919,6 +1059,7 @@ InterruptedToolCallRepair repairInterruptedToolCallImpl(string[] lines, string t
 					record.object["toolUseResult"] = JSONValue(resultText);
 					record.object.remove("toolDenialKind");
 					resultUuid = interruptedToolCallStringAt(record, "uuid");
+					resultPromptId = interruptedToolCallStringAt(record, "promptId");
 					rewritten ~= record.toString();
 					rewroteResult = true;
 					continue;
@@ -931,6 +1072,7 @@ InterruptedToolCallRepair repairInterruptedToolCallImpl(string[] lines, string t
 		return null;
 
 	string interruptionUuid;
+	string interruptionParentUuid;
 	string[] withoutInterruption;
 	foreach (line; rewritten)
 	{
@@ -945,9 +1087,18 @@ InterruptedToolCallRepair repairInterruptedToolCallImpl(string[] lines, string t
 
 		if (interruptionUuid.length == 0
 			&& interruptedToolCallStringAt(record, "type") == "user"
-			&& interruptedToolCallStringAt(record, "parentUuid") == resultUuid
+			&& (interruptedToolCallStringAt(record, "parentUuid") == resultUuid
+				|| (resultPromptId.length > 0
+					&& interruptedToolCallStringAt(record, "promptId") == resultPromptId))
 			&& interruptedToolCallHasKey(record, "message"))
 		{
+			auto markerUuid = interruptedToolCallStringAt(record, "uuid");
+			auto markerParentUuid = interruptedToolCallStringAt(record, "parentUuid");
+			if (markerUuid.length == 0 || markerParentUuid.length == 0)
+			{
+				withoutInterruption ~= line;
+				continue;
+			}
 			auto message = record.object["message"];
 			if (interruptedToolCallHasKey(message, "content")
 				&& message.object["content"].type == JSONType.array
@@ -959,9 +1110,9 @@ InterruptedToolCallRepair repairInterruptedToolCallImpl(string[] lines, string t
 					&& (text == "[Request interrupted by user for tool use]"
 						|| text == "[Request interrupted by user]"))
 				{
-					interruptionUuid = interruptedToolCallStringAt(record, "uuid");
-					if (interruptionUuid.length > 0)
-						continue;
+					interruptionUuid = markerUuid;
+					interruptionParentUuid = markerParentUuid;
+					continue;
 				}
 			}
 		}
@@ -969,6 +1120,7 @@ InterruptedToolCallRepair repairInterruptedToolCallImpl(string[] lines, string t
 	}
 	if (interruptionUuid.length == 0)
 		return new InterruptedToolCallRepair(withoutInterruption);
+	assert(interruptionParentUuid.length > 0);
 
 	string[] repaired;
 	foreach (line; withoutInterruption)
@@ -986,7 +1138,7 @@ InterruptedToolCallRepair repairInterruptedToolCallImpl(string[] lines, string t
 		foreach (key; ["leafUuid", "parentUuid"])
 			if (interruptedToolCallStringAt(record, key) == interruptionUuid)
 			{
-				record.object[key] = JSONValue(resultUuid);
+				record.object[key] = JSONValue(interruptionParentUuid);
 				changed = true;
 			}
 		repaired ~= changed ? record.toString() : line;
@@ -1022,6 +1174,71 @@ unittest
 	assert(older !is null && older.lines.length == 3);
 	assert(older.removedInterruptionUuid == "u2");
 	assert(parseJSON(older.lines[2])["leafUuid"].str == "u1");
+
+	// Claude 2.1.272 may put an attachment between the rewritten result and
+	// its native interruption marker. promptId links the two records; removing
+	// the marker must retain that attachment as the parent of subsequent rows.
+	auto attachment = `{"type":"attachment","uuid":"at1","parentUuid":"u1","promptId":"p1"}`;
+	auto attachedInterruption = `{"type":"user","uuid":"u3","parentUuid":"at1","promptId":"p1","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}`;
+	auto attachedChild = `{"type":"assistant","uuid":"a2","parentUuid":"u3","promptId":"p1","message":{"content":[]}}`;
+	auto attachedLastPrompt = `{"type":"last-prompt","leafUuid":"u3","sessionId":"session"}`;
+	auto promptLinked = repairInterruptedToolCallImpl([
+		assistant,
+		`{"type":"user","uuid":"u1","parentUuid":"a1","promptId":"p1","message":{"role":"user","content":[{"type":"tool_result","content":"rejected","is_error":true,"tool_use_id":"toolu_switch"}]}}`,
+		attachment, attachedInterruption, attachedChild, attachedLastPrompt,
+	], "mcp__cydo__SwitchMode", "RESULT");
+	assert(promptLinked !is null && promptLinked.lines.length == 5);
+	assert(promptLinked.removedInterruptionUuid == "u3");
+	assert(parseJSON(promptLinked.lines[2])["uuid"].str == "at1");
+	assert(parseJSON(promptLinked.lines[3])["parentUuid"].str == "at1");
+	assert(parseJSON(promptLinked.lines[4])["leafUuid"].str == "at1");
+
+	// Exact native marker text alone is not enough: a different transaction's
+	// interruption must survive when it is neither a result child nor prompt-linked.
+	auto unrelatedInterruption = `{"type":"user","uuid":"other-u","parentUuid":"other-parent","promptId":"other-prompt","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}`;
+	auto unrelatedMarker = repairInterruptedToolCallImpl([
+		assistant,
+		`{"type":"user","uuid":"u1","parentUuid":"a1","promptId":"p1","message":{"role":"user","content":[{"type":"tool_result","content":"rejected","is_error":true,"tool_use_id":"toolu_switch"}]}}`,
+		unrelatedInterruption,
+	], "mcp__cydo__SwitchMode", "RESULT");
+	assert(unrelatedMarker !is null && unrelatedMarker.lines.length == 3);
+	assert(unrelatedMarker.removedInterruptionUuid.length == 0);
+	assert(unrelatedMarker.lines[2] == unrelatedInterruption);
+
+	// Missing prompt IDs cannot link an indirect marker to the repaired result.
+	auto missingPromptMarker = `{"type":"user","uuid":"u3","parentUuid":"at1","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}`;
+	auto missingPromptIds = repairInterruptedToolCallImpl([
+		assistant, rejected,
+		`{"type":"attachment","uuid":"at1","parentUuid":"u1"}`,
+		missingPromptMarker,
+	], "mcp__cydo__SwitchMode", "RESULT");
+	assert(missingPromptIds !is null && missingPromptIds.lines.length == 4);
+	assert(missingPromptIds.removedInterruptionUuid.length == 0);
+	assert(missingPromptIds.lines[3] == missingPromptMarker);
+
+	// A prompt-linked native marker without a usable linkage cannot be removed
+	// because descendants have no valid parent to target.
+	auto missingParentMarker = `{"type":"user","uuid":"u3","promptId":"p1","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}`;
+	auto missingParent = repairInterruptedToolCallImpl([
+		assistant,
+		`{"type":"user","uuid":"u1","parentUuid":"a1","promptId":"p1","message":{"role":"user","content":[{"type":"tool_result","content":"rejected","is_error":true,"tool_use_id":"toolu_switch"}]}}`,
+		missingParentMarker,
+	], "mcp__cydo__SwitchMode", "RESULT");
+	assert(missingParent !is null && missingParent.lines.length == 3);
+	assert(missingParent.removedInterruptionUuid.length == 0);
+	assert(missingParent.lines[2] == missingParentMarker);
+
+	// A marker UUID is likewise required before an indirect marker can be
+	// selected and subsequently relinked.
+	auto missingUuidMarker = `{"type":"user","parentUuid":"at1","promptId":"p1","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}`;
+	auto missingUuid = repairInterruptedToolCallImpl([
+		assistant,
+		`{"type":"user","uuid":"u1","parentUuid":"a1","promptId":"p1","message":{"role":"user","content":[{"type":"tool_result","content":"rejected","is_error":true,"tool_use_id":"toolu_switch"}]}}`,
+		missingUuidMarker,
+	], "mcp__cydo__SwitchMode", "RESULT");
+	assert(missingUuid !is null && missingUuid.lines.length == 3);
+	assert(missingUuid.removedInterruptionUuid.length == 0);
+	assert(missingUuid.lines[2] == missingUuidMarker);
 
 	auto noInterruption = repairInterruptedToolCallImpl([assistant, rejected],
 		"mcp__cydo__SwitchMode", "RESULT");
@@ -1247,7 +1464,10 @@ class ClaudeCodeSession : AgentSession
 			claudeArgs ~= ["--effort", config.effort];
 
 		if (config.appendSystemPrompt.length > 0)
-			claudeArgs ~= ["--append-system-prompt", config.appendSystemPrompt];
+			claudeArgs ~= [
+				"--append-system-prompt", config.appendSystemPrompt,
+				"--system-prompt-snapshot", "off",
+			];
 
 		// Monitor interacts poorly with batch execution: the agent may yield its
 		// turn (producing a result) after calling Monitor, expecting a ping when
@@ -1316,35 +1536,58 @@ class ClaudeCodeSession : AgentSession
 			if (exitHandler)
 				exitHandler(status);
 		};
+
+		process.onLineHandlerError = (string source, Exception e) {
+			reportLineHandlerError(source, e);
+		};
+	}
+
+	/// Surface a contained line-handler fault on the task it belongs to.
+	/// The session keeps running: the agent process is unaffected by CyDo
+	/// failing to translate one of its lines, and the rest of the turn is
+	/// still worth showing.
+	private void reportLineHandlerError(string source, Exception e)
+	{
+		import cydo.protocol : TaskDiagnosticEvent, TaskDiagnosticSeverity;
+
+		TaskDiagnosticEvent ev;
+		ev.severity = TaskDiagnosticSeverity.error;
+		ev.subject = "CyDo error";
+		ev.body = "Failed to process agent " ~ source ~ ": " ~ e.msg;
+		emitEvent(TranslatedEvent(toJson(ev), null));
 	}
 
 	/// Send a user message formatted as Claude stream-json input.
 	/// correlationId is accepted for interface compatibility but not used:
 	/// Claude has no separable app-server acknowledgment beyond local enqueue.
 	Promise!AgentSubmissionReceipt sendMessage(const(ContentBlock)[] content, string correlationId = null,
-		bool isContextBootstrap = false)
+		bool isContextBootstrap = false, string nativeSubmissionUuid = null)
 	{
 		try
 		{
-			// Use plain string content when possible (single text block) for backward
-			// compatibility with Claude CLI's JSONL format.  Array content is only
-			// needed when images or multiple blocks are present.
-			JSONFragment claudeContent;
-			if (content.length == 1 && content[0].type == "text")
-				claudeContent = JSONFragment(toJson(content[0].text));
-			else
-				claudeContent = buildClaudeContentBlocks(content);
-			auto input = ClaudeInput(
-				"user",
-				ClaudeInputMessage("user", claudeContent),
-				"default",
-				null,
-			);
-			process.sendMessage(toJson(input));
+			process.sendMessage(serializeClaudeInput(content, nativeSubmissionUuid));
 		}
 		catch (Exception e)
 			return reject!AgentSubmissionReceipt(e);
 		return resolve(AgentSubmissionReceipt.localEnqueued);
+	}
+
+	private static string serializeClaudeInput(const(ContentBlock)[] content,
+		string nativeSubmissionUuid)
+	{
+		import std.uuid : UUID, randomUUID;
+		JSONFragment claudeContent;
+		if (content.length == 1 && content[0].type == "text")
+			claudeContent = JSONFragment(toJson(content[0].text));
+		else
+			claudeContent = buildClaudeContentBlocks(content);
+		auto inputUuid = nativeSubmissionUuid.length > 0
+			? nativeSubmissionUuid : randomUUID().toString();
+		if (nativeSubmissionUuid.length > 0)
+			enforce(!UUID(nativeSubmissionUuid).empty,
+				"Claude submission UUID must not be nil");
+		return toJson(ClaudeInput("user", inputUuid,
+			ClaudeInputMessage("user", claudeContent), "default", null));
 	}
 
 	void invalidatePendingSubmittedMessages() {}
@@ -2108,6 +2351,28 @@ unittest
 		assert(fulfilled);
 	}
 
+	{
+		enum supplied = "A32A27AF-7CC1-429D-888D-637C6CFCF9DD";
+		auto input = jsonParse!ClaudeInput(ClaudeCodeSession.serializeClaudeInput(
+			[ContentBlock("text", "uuid transport")], supplied));
+		assert(input.uuid == supplied);
+	}
+
+	{
+		auto input = jsonParse!ClaudeInput(ClaudeCodeSession.serializeClaudeInput(
+			[ContentBlock("text", "uuid transport")], null));
+		import std.uuid : UUID;
+		assert(!UUID(input.uuid).empty);
+	}
+
+	foreach (invalid; ["not-a-uuid", "00000000-0000-0000-0000-000000000000"])
+	{
+		bool rejected;
+		try ClaudeCodeSession.serializeClaudeInput([ContentBlock("text", "invalid uuid")], invalid);
+		catch (Exception) rejected = true;
+		assert(rejected);
+	}
+
 	// A disconnected local transport rejects through the returned promise.
 	{
 		auto session = new ClaudeCodeSession("true");
@@ -2160,6 +2425,7 @@ struct ClaudeImageBlock { string type = "image"; ClaudeImageSource source; }
 struct ClaudeInput
 {
 	string type;
+	string uuid;
 	ClaudeInputMessage message;
 	string session_id;
 	string parent_tool_use_id;

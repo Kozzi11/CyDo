@@ -21,15 +21,15 @@
           # official installer deploys.
           claude-code =
             let
-              version = "2.1.220";
+              version = "2.1.272";
               claudeSrc = {
                 x86_64-linux = {
                   platform = "linux-x64";
-                  hash = "sha256-2D+o94sWreWdAiwpKEF0PGUjQXJRDpA62t3PaZKxsZo=";
+                  hash = "sha256-xC3cEBRRa+F1WvrkUa+/1KqtnpL+W9vv7T2smiQiSDk=";
                 };
                 aarch64-linux = {
                   platform = "linux-arm64";
-                  hash = "sha256-ILK1Nj//Q4pG0btQyIX7/aHMlK8iu5HJ5SSIY1e+vho=";
+                  hash = "sha256-huaaWuav5F1cGrnVkgU4nNlytx33Zbjo/jw2FBWmOJA=";
                 };
               }.${system} or (throw "Claude Code: unsupported system ${system}");
             in final.stdenv.mkDerivation {
@@ -751,6 +751,7 @@ EOF
             ANTHROPIC_BASE_URL = "http://127.0.0.1:9000";
             ANTHROPIC_API_KEY = "test-key-mock";
             CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
+            CLAUDE_CODE_BASH_EDIT_DIFF = "1";
             DISABLE_TELEMETRY = "1";
             DISABLE_AUTOUPDATER = "1";
             CLAUDE_CONFIG_DIR = "/tmp/claude-test-home";
@@ -883,6 +884,7 @@ EOF
               ln -sf ${fail-claude} /tmp/fake-bin/fail-claude
               export PATH="/tmp/fake-bin:$PATH"
               ${if claudeBin != null then "export CYDO_CLAUDE_BIN=\"${claudeBin}\"" else ""}
+              export CYDO_CAPTURE_DIR=""
 
               ${lib.optionalString (agentType == "copilot") ''
               ln -sf ${copilot}/bin/copilot /tmp/fake-bin/copilot
@@ -924,6 +926,7 @@ EOF
               cp -r $src /tmp/tests
               chmod -R u+w /tmp/tests
               chmod +x /tmp/tests/extra-fields-wrapper.sh
+              chmod +x /tmp/tests/claude-capture-wrapper.sh
               chmod +x /tmp/tests/suggestion-one-shot-fail-wrapper.sh
               chmod +x /tmp/tests/title-one-shot-env-wrapper.sh
               cd /tmp/tests
