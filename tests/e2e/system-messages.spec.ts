@@ -130,39 +130,40 @@ test("task prompt system message keeps task type label after reload", { tag: ["@
   }).toPass();
 
   // Wait for the child to finish: CyDo returns focus to the parent when a
-  // sub-task completes, and fast agents (vibe) finish before the sidebar
-  // click below — racing the focus-return would keep the parent's view
-  // active no matter what we click.
+  // sub-task completes, and fast agents finish before the sidebar click
+  // below — racing the focus-return would keep the parent's view active no
+  // matter what we click.
   await expect(async () => {
     const childDone = taskUpdatedEvents.find(
       (event) => event.tid === childTid && !event.alive,
     );
     expect(childDone).toBeTruthy();
-  }).toPass();
+  }).toPass({ timeout: responseTimeout(agentType) });
 
-  // Wait for the parent's turn to end as well: while it is still processing,
-  // the focus router keeps pulling the view back to the parent. A late
-  // focus_hint (child → parent, emitted when the parent's session digests the
-  // sub-task result) can still arrive after the navigation, so retry the
-  // visit until it sticks — each hint is one-shot.
-  const input = page.locator(".input-textarea:visible").first();
-  await expect(input).toBeEnabled();
+  // Live view through the real click navigation: the child's sidebar item
+  // opens the child task and renders its task-prompt system message.
+  await page.locator(`.sidebar-item[data-tid="${childTid}"]`).waitFor({
+    state: "visible",
+  });
+  await page.locator(`.sidebar-item[data-tid="${childTid}"]`).click();
+  await expect(
+    page.locator(`.sidebar-item[data-tid="${childTid}"].active`),
+  ).toBeVisible();
+  await expect(
+    page.locator('[style*="display: contents"] .message-list .system-user-message', {
+      hasText: "Task prompt: research",
+    }),
+  ).toBeVisible();
 
-  const childTaskActive = page.locator(`.sidebar-item[data-tid="${childTid}"].active`);
-  const childTaskPrompt = page.locator(
-    '[style*="display: contents"] .message-list .system-user-message',
-    { hasText: "Task prompt: research" },
-  );
-  await expect(async () => {
-    await page.goto(`/local/cydo-test-workspace/task/${childTid}`);
-    await expect(childTaskActive).toBeVisible({ timeout: 10_000 });
-    await expect(childTaskPrompt).toBeVisible({ timeout: 10_000 });
-  }).toPass({ timeout: 120_000 });
-
+  // The same message survives a reload plus click navigation.
   await page.reload();
-  await expect(async () => {
-    await page.goto(`/local/cydo-test-workspace/task/${childTid}`);
-    await expect(childTaskActive).toBeVisible({ timeout: 10_000 });
-    await expect(childTaskPrompt).toBeVisible({ timeout: 10_000 });
-  }).toPass({ timeout: 120_000 });
+  await page.locator(`.sidebar-item[data-tid="${childTid}"]`).click();
+  await expect(
+    page.locator(`.sidebar-item[data-tid="${childTid}"].active`),
+  ).toBeVisible();
+  await expect(
+    page.locator('[style*="display: contents"] .message-list .system-user-message', {
+      hasText: "Task prompt: research",
+    }),
+  ).toBeVisible();
 });

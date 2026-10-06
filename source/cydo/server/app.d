@@ -1800,7 +1800,10 @@ class App
 				TaskStatus.alive, TaskNotificationChange.clearAttention);
 		else
 		{
+			// Match transitionTask's clearAttention semantics: an alive task
+			// being resumed drops both its attention flag and its body.
 			td.needsAttention = false;
+			td.notificationBody = "";
 			persistence.setNeedsAttention(tid, false);
 			broadcastTaskUpdate(tid);
 		}
@@ -2546,8 +2549,8 @@ class App
 	/// otherwise ride along in the resumed conversation forever.
 	private void reframePersistedSessionStart(int tid, TaskTypeDef* newTypeDef)
 	{
-		import std.file : exists, readText, write;
-		import std.string : lineSplitter;
+		import std.array : split;
+		import std.file : exists, readText, rename, write;
 		auto agent = tryAgentForTask(tid);
 		if (agent is null || agent.supportsDeveloperPrompt)
 			return;
@@ -2581,9 +2584,18 @@ class App
 		auto newMemory = loadProjectMemory(newTypeDef, td.repoPath,
 			taskTypeCatalog.promptSearchPath(td.projectPath));
 
+		// Split on '\n' only: JSON string content may legally contain
+		// \r, U+0085, U+2028 and U+2029 raw, and a lineSplitter-based
+		// split would tear such messages into invalid JSON lines.
+		auto lines = readText(path).split('\n');
+		// Preserve the original trailing-newline state exactly.
+		bool trailingNewline = lines.length > 0 && lines[$-1].length == 0;
+		if (trailingNewline)
+			lines = lines[0 .. $-1];
+
 		string rewritten;
 		bool reframed;
-		foreach (line; readText(path).lineSplitter)
+		foreach (i, line; lines)
 		{
 			if (!reframed && line.length > 0)
 			{
@@ -2595,7 +2607,9 @@ class App
 					reframed = true;
 				}
 			}
-			rewritten ~= line ~ "\n";
+			rewritten ~= line;
+			if (i + 1 < lines.length || trailingNewline)
+				rewritten ~= "\n";
 		}
 		if (!reframed)
 		{
@@ -2603,7 +2617,11 @@ class App
 				tid, path);
 			return;
 		}
-		write(path, rewritten);
+		// Write via a temp file + rename so a crash or full disk mid-write
+		// cannot truncate the session history.
+		auto tmpPath = path ~ ".cydo-reframe.tmp";
+		write(tmpPath, rewritten);
+		rename(tmpPath, path);
 		tracef("reframePersistedSessionStart[%d]: reframed session start for type %s",
 			tid, td.taskType);
 	}
@@ -2880,7 +2898,13 @@ class App
 
 		if (ta.isUserMessageLine(line))
 		{
-			auto ts = ta.translateHistoryLine(line, lineNum);
+			// The tailed file's path gates file-reference translation
+			// (vibe image inlining); a missing resolution degrades that.
+			string tailedHistoryPath;
+			auto resolution = resolveTaskHistory(tid);
+			if (resolution.kind == TaskHistoryResolutionKind.access)
+				tailedHistoryPath = resolution.requireAccess().path;
+			auto ts = ta.translateHistoryLine(line, lineNum, tailedHistoryPath);
 			if (ts.length == 0)
 				return;
 			@JSONPartial static struct TypeProbe { string type; }

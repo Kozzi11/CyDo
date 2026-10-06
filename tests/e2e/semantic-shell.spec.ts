@@ -9,6 +9,12 @@ import {
   type Locator,
 } from "./fixtures";
 
+// Assertions inside a toPass predicate must use a short timeout: semantic
+// classification can complete mid-wait and auto-collapse the result, which
+// should fail the iteration fast so toPass can click the header again and
+// retry instead of blocking for the full expect timeout.
+const expandAssertTimeout = 2000;
+
 async function lastShellToolCall(
   page: Page,
   agentType: AgentType,
@@ -38,8 +44,8 @@ async function expectExpandedResultContent(
     ) {
       await resultHeader.click();
     }
-    await expect(resultContainer).toBeVisible();
-    await expect(semanticContent).toBeVisible();
+    await expect(resultContainer).toBeVisible({ timeout: expandAssertTimeout });
+    await expect(semanticContent).toBeVisible({ timeout: expandAssertTimeout });
   }).toPass({ timeout });
 }
 
@@ -58,8 +64,10 @@ async function expectExpandedRawResultText(
     ) {
       await resultHeader.click();
     }
-    await expect(resultContainer).toBeVisible();
-    await expect(rawResult).toContainText(expected);
+    await expect(resultContainer).toBeVisible({ timeout: expandAssertTimeout });
+    await expect(rawResult).toContainText(expected, {
+      timeout: expandAssertTimeout,
+    });
   }).toPass({ timeout });
 }
 
@@ -102,8 +110,7 @@ test("semantic shell: cat read renders through file content preview", async ({
  * Asserts that the command input renders as three visible parts:
  * header line, body content, and terminator.
  */
-test("semantic shell: heredoc write renders header/body/footer",
-    async ({
+test("semantic shell: heredoc write renders header/body/footer", async ({
   page,
   agentType,
 }) => {
@@ -206,8 +213,7 @@ test("semantic shell: unrecognized pipe stage falls back to normal rendering", a
  * Asserts that the command input renders as three parts: header, script
  * content, and terminator, using the semantic-shell-script container.
  */
-test("semantic shell: heredoc script renders with syntax-highlighted body",
-    async ({
+test("semantic shell: heredoc script renders with syntax-highlighted body", async ({
   page,
   agentType,
 }) => {
@@ -267,7 +273,9 @@ test("semantic shell: git diff renders through patch view", async ({
 
   // Result is collapsed by default for diffs (local source, re-derivable).
   // Use toPass so that if semantic parsing completes and collapses the result
-  // after our initial visibility check, we click again and retry.
+  // after our initial visibility check, we click again and retry. The inner
+  // assertion uses a short timeout so a mid-wait collapse fails the iteration
+  // fast instead of blocking for the full expect timeout.
   const resultHeader = toolCall.locator(".tool-result-header");
   const resultContainer = toolCall.locator(".tool-result-container");
   const semanticDiff = toolCall.locator('[data-testid="semantic-shell-diff"]');
@@ -275,7 +283,7 @@ test("semantic shell: git diff renders through patch view", async ({
     if (await resultHeader.isVisible() && !await resultContainer.isVisible()) {
       await resultHeader.click();
     }
-    await expect(semanticDiff).toBeVisible();
+    await expect(semanticDiff).toBeVisible({ timeout: expandAssertTimeout });
   }).toPass({ timeout });
 });
 
@@ -397,8 +405,7 @@ test("semantic shell: direct svg heredoc write offers rendered image preview", a
   });
 });
 
-test("semantic shell: mixed-quoted markdown heredoc renders markdown body",
-    async ({
+test("semantic shell: mixed-quoted markdown heredoc renders markdown body", async ({
   page,
   agentType,
 }) => {
@@ -528,8 +535,7 @@ test("semantic shell: dynamic wrapper payload falls back to normal command input
   );
 });
 
-test("semantic shell: rg structured output keeps per-line prefixes and independent line rendering",
-    async ({
+test("semantic shell: rg structured output keeps per-line prefixes and independent line rendering", async ({
   page,
   agentType,
 }) => {

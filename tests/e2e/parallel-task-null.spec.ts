@@ -1,7 +1,6 @@
 import { test, expect, enterSession, sendMessage } from "./fixtures";
 
-test("parallel Task results keep request order and never render null",
-    async ({
+test("parallel Task results keep request order and never render null", async ({
   page,
 }) => {
   await enterSession(page);

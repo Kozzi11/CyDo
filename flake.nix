@@ -3,13 +3,9 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    screenshot-fixtures = {
-      url = "git+file:docs/tools/screenshots/fixtures";
-      flake = false;
-    };
   };
 
-  outputs = { self, nixpkgs, screenshot-fixtures }:
+  outputs = { self, nixpkgs }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ];
       pkgsFor = system: import nixpkgs {
@@ -413,7 +409,9 @@ EOF
             version = "0.1.0";
 
             src = screenshotSrc;
-            fixtures = screenshot-fixtures;
+            # No fixtures input: docs/tools/screenshots/fixtures is an orphaned
+            # gitlink (no .gitmodules, content unavailable), which made the
+            # input unfetchable and broke `nix flake check` repo-wide.
             inherit cydo;
 
             nativeBuildInputs = with pkgs; [
@@ -903,8 +901,37 @@ EOF
               workspaces:
                 local:
                   root: /tmp/cydo-test-workspace
+              ${lib.optionalString (agentType == "vibe" && !(lib.hasPrefix "e2e/model-effort-reaches-api.spec.ts:" testMatch)) ''
+                # Vibe sessions apply CyDo's resolved model per task via the
+                # `model` ACP config option (session/set_config_option); the
+                # real vibe-acp validates the value against its model
+                # catalog, so map every class CyDo uses to the mock
+                # backend's "mock" model alias (config.toml [[models]])
+                # instead of the driver's Mistral defaults, which would
+                # switch the session off the mock API.
+                agents:
+                  vibe:
+                    model_aliases:
+                      small:
+                        model: mock
+                      medium:
+                        model: mock
+                      large:
+                        model: mock
+              ''}
               ${lib.optionalString (lib.hasPrefix "e2e/model-effort-reaches-api.spec.ts:" testMatch) ''
+              # One `agents:` mapping for the model-effort probe: the vibe
+              # model aliases (see above) share it with the per-class effort
+              # overrides under test.
               agents:
+                vibe:
+                  model_aliases:
+                    small:
+                      model: mock
+                    medium:
+                      model: mock
+                    large:
+                      model: mock
                 codex:
                   model_aliases:
                     large:

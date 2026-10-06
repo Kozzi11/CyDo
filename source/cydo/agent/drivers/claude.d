@@ -625,7 +625,7 @@ class ClaudeCodeAgent : Agent
 		assert(agent.historyPath(idB, profile) == fresh);
 	}
 
-	TranslatedEvent[] translateHistoryLine(string line, int lineNum)
+	TranslatedEvent[] translateHistoryLine(string line, int lineNum, string historyPath = null)
 	{
 		return translateClaudeHistoryEvent(line);
 	}

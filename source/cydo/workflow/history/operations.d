@@ -52,10 +52,8 @@ HistoryOperations selectHistoryOperations(AgentDriver driver,
 		result.undo.agent_turn = HistoryOperationMechanism.jsonl;
 		return result;
 	}
-	switch (codexForkSource)
+	final switch (codexForkSource)
 	{
-	default:
-		break;
 	case CodexForkSourceState.dead:
 		// The pinned Codex 0.144.1 thread/fork accepts completed turns only; it has no
 		// user/response cut parameter, so user-boundary forks are unsupported.

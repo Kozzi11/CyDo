@@ -22,21 +22,30 @@ test("diff result: toggle reveals raw git log output and headers", { tag: "@no-c
 
   // Result is collapsed by default for diffs (local source, re-derivable).
   // Use toPass so that if semantic parsing completes and collapses the result
-  // after our initial visibility check, we click again and retry.
+  // after our initial visibility check, we click again and retry. The inner
+  // assertions use a short timeout so a mid-wait collapse fails the iteration
+  // fast instead of blocking for the full expect timeout. The predicate only
+  // passes once the header click has pinned the result open: classification
+  // can complete in the same frame the diff renders, and the auto-collapse
+  // effect would then unmount the diff before the toggle assertions below.
+  const expandAssertTimeout = 2000;
   const resultHeader = toolCall.locator(".tool-result-header");
   const resultContainer = toolCall.locator(".tool-result-container");
   const diff = toolCall.locator('[data-testid="semantic-shell-diff"]');
   const diffView = diff.locator(".diff-view").first();
+  let pinned = false;
   await expect(async () => {
     if (
       (await resultHeader.isVisible()) &&
       !(await resultContainer.isVisible())
     ) {
       await resultHeader.click();
+      pinned = true;
     }
-    await expect(resultContainer).toBeVisible();
-    await expect(diff).toBeVisible();
-    await expect(diffView).toBeVisible();
+    if (!pinned) throw new Error("result not pinned open yet");
+    await expect(resultContainer).toBeVisible({ timeout: expandAssertTimeout });
+    await expect(diff).toBeVisible({ timeout: expandAssertTimeout });
+    await expect(diffView).toBeVisible({ timeout: expandAssertTimeout });
   }).toPass({ timeout });
 
   const toggle = diff.locator(".markdown-toggle-btn");

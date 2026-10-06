@@ -1512,6 +1512,18 @@ function handleChatCompletions(req, res) {
     if (hasImages && intent !== null && intent.type === "text") {
       intent.text = "image received";
     }
+    if (process.env.MOCK_OPENAI_CAPTURE) {
+      appendFileSync(
+        process.env.MOCK_OPENAI_CAPTURE,
+        JSON.stringify({
+          path: req.url || "/v1/chat/completions",
+          model: requestedModel,
+          userText,
+          isToolOutput: isToolResult,
+          reasoningEffort: null,
+        }) + "\n",
+      );
+    }
     console.log(
       `[mock-api] [chat] model=${requestedModel} userText=${JSON.stringify(userText)} isToolResult=${isToolResult} msgCount=${messages.length}${hasImages ? " images=true" : ""}`,
     );
@@ -1617,9 +1629,12 @@ function handleChatCompletions(req, res) {
       // Emit a role delta so the stream is well-formed, then never finish.
       emit({ role: "assistant", content: "" });
     } else {
-      // Unsupported fixture type for this dialect — answer with plain text so
-      // the turn terminates deterministically instead of hanging.
-      emitText(`Done. (unsupported intent ${intent.type})`);
+      // Unsupported fixture type for this dialect — fail loudly instead
+      // of answering with a text the suite's success sentinel
+      // ("Done.") would match: a false green here means a spec is
+      // running against an intent its dialect never implemented.
+      // The turn still terminates deterministically instead of hanging.
+      emitText(`MOCK-UNSUPPORTED-INTENT ${intent.type}`);
       finishStream();
     }
   });

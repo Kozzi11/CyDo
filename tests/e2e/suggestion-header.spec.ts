@@ -10,8 +10,7 @@ import {
 // Regression test: buildAbbreviatedHistory must count user messages correctly.
 // The suggestion prompt's [Session: N user messages, ...] header should reflect
 // the actual number of user messages sent, not 0.
-test("suggestion header reports correct user message count",
-    async ({
+test("suggestion header reports correct user message count", async ({
   page,
   agentType,
 }) => {
@@ -60,8 +59,7 @@ test("suggestion header reports correct user message count",
 // Bug: item/completed events from live streaming don't carry the text field,
 // so extractMessageText() returns empty and assistant entries are skipped.
 // The abbreviated history should contain "A: ..." entries for assistant responses.
-test("suggestion history includes assistant text entries",
-    async ({
+test("suggestion history includes assistant text entries", async ({
   page,
   agentType,
 }) => {

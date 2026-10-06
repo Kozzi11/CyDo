@@ -623,8 +623,7 @@ test("Ask/Answer: child asks parent, parent answers", async ({
   ).toBeVisible();
 });
 
-test("Ask/Answer: parent can answer child question after another Task call",
- async ({
+test("Ask/Answer: parent can answer child question after another Task call", async ({
   page,
 }) => {
   const observedTaskResults = observeTaskResultItems(page);
@@ -706,8 +705,7 @@ test("Ask/Answer: parent can answer child question after another Task call",
   );
 });
 
-test("Ask/Answer: completed task result exposes success status and preserved fields",
- async ({
+test("Ask/Answer: completed task result exposes success status and preserved fields", async ({
   page,
   agentType,
 }) => {
@@ -751,8 +749,7 @@ test("Ask/Answer: completed task result exposes success status and preserved fie
   }
 });
 
-test("Ask/Answer: task validation errors expose error status and error field",
- async ({
+test("Ask/Answer: task validation errors expose error status and error field", async ({
   page,
   agentType,
 }) => {
@@ -778,8 +775,7 @@ test("Ask/Answer: task validation errors expose error status and error field",
   });
 });
 
-test("Ask/Answer: task summaries preserve literal JSON-looking child final text",
- async ({
+test("Ask/Answer: task summaries preserve literal JSON-looking child final text", async ({
   page,
   agentType,
 }) => {
@@ -805,8 +801,7 @@ test("Ask/Answer: task summaries preserve literal JSON-looking child final text"
   });
 });
 
-test("Ask/Answer: batch with one completing child and one asking child",
- async ({
+test("Ask/Answer: batch with one completing child and one asking child", async ({
   page,
   agentType,
 }) => {
@@ -869,8 +864,7 @@ test("Ask/Answer: batch with one completing child and one asking child",
   ).toHaveAttribute("href", /\/task\/3$/);
 });
 
-test("Ask/Answer: same-workspace top-level peer Ask succeeds",
- async ({
+test("Ask/Answer: same-workspace top-level peer Ask succeeds", async ({
   page,
   agentType,
 }) => {
@@ -927,8 +921,7 @@ test("Ask/Answer: same-workspace top-level peer Ask succeeds",
   ).not.toBeVisible();
 });
 
-test("Ask/Answer: same-workspace non-direct Ask succeeds",
- async ({
+test("Ask/Answer: same-workspace non-direct Ask succeeds", async ({
   page,
   agentType,
 }) => {
@@ -1012,8 +1005,7 @@ test("Ask/Answer: same-workspace non-direct Ask succeeds",
   ).not.toBeVisible();
 });
 
-test("Ask/Answer: wrong answerer gets Unknown question ID",
- async ({
+test("Ask/Answer: wrong answerer gets Unknown question ID", async ({
   page,
   agentType,
 }) => {
@@ -1069,8 +1061,7 @@ test("Ask/Answer: wrong answerer gets Unknown question ID",
   ).toBeVisible();
 });
 
-test("Ask/Answer: self Ask is rejected",
- async ({ page, agentType }) => {
+test("Ask/Answer: self Ask is rejected", async ({ page, agentType }) => {
   await enterSession(page);
   await sendMessage(page, 'reply with "self-ask-root-ready"');
   await expect(
@@ -1096,8 +1087,7 @@ test("Ask/Answer: self Ask is rejected",
   ).not.toBeVisible();
 });
 
-test("Ask/Answer: invalid Ask target returns error",
- async ({
+test("Ask/Answer: invalid Ask target returns error", async ({
   page,
   agentType,
 }) => {
@@ -1261,8 +1251,7 @@ test("Ask/Answer: two children asking simultaneously are queued", async ({
   ).toBeVisible();
 });
 
-test("Ask/Answer: Ask to active sub-task delivers follow-up message",
- async ({
+test("Ask/Answer: Ask to active sub-task delivers follow-up message", async ({
   page,
   agentType,
 }) => {
@@ -1317,8 +1306,7 @@ test("Ask/Answer: Ask to active sub-task delivers follow-up message",
   ).toBeVisible();
 });
 
-test("Ask/Answer: parent returns to waiting after answering mid-batch",
- async ({
+test("Ask/Answer: parent returns to waiting after answering mid-batch", async ({
   page,
   agentType,
 }) => {
@@ -1376,8 +1364,7 @@ test("Ask/Answer: parent returns to waiting after answering mid-batch",
   ).toBeVisible();
 });
 
-test("Ask/Answer: Ask to busy (waiting) sub-task is enqueued",
- async ({
+test("Ask/Answer: Ask to busy (waiting) sub-task is enqueued", async ({
   page,
   agentType,
 }) => {
@@ -1418,8 +1405,7 @@ test("Ask/Answer: Ask to busy (waiting) sub-task is enqueued",
   ).toBeVisible();
 });
 
-test("Ask/Answer: Ask to busy sub-task fails if child exits before delivery",
- async ({
+test("Ask/Answer: Ask to busy sub-task fails if child exits before delivery", async ({
   page,
   agentType,
 }) => {
@@ -1467,8 +1453,7 @@ test("Ask/Answer: Ask to busy sub-task fails if child exits before delivery",
   ).toBeVisible();
 });
 
-test("Ask/Answer: yield enforcement steers parent with unanswered child question",
- async ({
+test("Ask/Answer: yield enforcement steers parent with unanswered child question", async ({
   page,
   agentType,
 }) => {
@@ -1531,8 +1516,7 @@ test("Ask/Answer: yield enforcement steers parent with unanswered child question
   ).toBeVisible();
 });
 
-test("Ask/Answer: answer delivery is deferred until child becomes idle",
- async ({
+test("Ask/Answer: answer delivery is deferred until child becomes idle", async ({
   page,
   agentType,
 }) => {
@@ -1634,8 +1618,7 @@ test(
   },
 );
 
-test("Ask/Answer: Answer with invalid qid returns error",
- async ({
+test("Ask/Answer: Answer with invalid qid returns error", async ({
   page,
   agentType,
 }) => {

@@ -30,8 +30,7 @@ async function waitForNewTid(page: Page, before: Set<string>): Promise<string> {
   return newTid!;
 }
 
-test("changing entry point after draft creation updates backend",
-    async ({
+test("changing entry point after draft creation updates backend", async ({
   page,
   agentType,
 }) => {

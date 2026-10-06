@@ -54,8 +54,7 @@ function getFdDetails(pid: number): string[] {
   });
 }
 
-test("agent session teardown does not leak file descriptors",
-    async ({
+test("agent session teardown does not leak file descriptors", async ({
   page,
   backend,
   agentType,
@@ -99,8 +98,7 @@ test("agent session teardown does not leak file descriptors",
   ).toBeLessThanOrEqual(fdBefore);
 });
 
-test("FD count stays stable across multiple session cycles",
-    async ({
+test("FD count stays stable across multiple session cycles", async ({
   page,
   backend,
   agentType,

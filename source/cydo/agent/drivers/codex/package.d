@@ -903,7 +903,7 @@ class CodexAgent : Agent
 		return result;
 	}
 
-	TranslatedEvent[] translateHistoryLine(string line, int lineNum)
+	TranslatedEvent[] translateHistoryLine(string line, int lineNum, string historyPath = null)
 	{
 		import std.conv : to;
 		import cydo.protocol : parseIso8601Timestamp;

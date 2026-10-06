@@ -312,6 +312,24 @@ agents:
 
 `effort` values are passed to the underlying CLI verbatim, so the accepted values are whatever that CLI accepts.
 
+### Mistral Vibe limitations
+
+The Vibe integration is experimental. Known gaps:
+
+- No file revert: undo restores the conversation but not the working tree.
+- Workspace `permission_policy` is ignored: ACP permission requests are
+  auto-approved (the CyDo permission UX rides its own MCP tools).
+- The resolved per-task model is applied per session via vibe's `model`
+  config option; `effort` must be one of `off`, `low`, `medium`, `high`
+  or `max` (anything else fails the session start with a diagnostic).
+- The first CyDo task bootstraps `~/.vibe/config.toml` (telemetry and
+  update checks off) and `~/.vibe/trusted_folders.toml` (the task work
+  dir) when absent — an existing profile is never modified. These files
+  are shared with standalone `vibe` CLI use.
+- Title and suggestion one-shot completions run `vibe --prompt` without
+  tools; vibe persists those runs as sessions, so they may appear in the
+  session discovery list and in `~/.vibe/logs/session`.
+
 ## Project Status
 
 CyDo is under active development. The current implementation covers phases 1-9 of the [roadmap](docs/VISION.md):

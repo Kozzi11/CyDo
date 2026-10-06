@@ -206,7 +206,7 @@ class HistoryEventPipeline
 				{
 					if (ta.isUserMessageLine(line))
 					{
-						auto ts = ta.translateHistoryLine(line, lineNum);
+						auto ts = ta.translateHistoryLine(line, lineNum, jsonlPath);
 						// a type:"user" JSONL line translates to either an
 						// item/started user_message (the consumption echo we're
 						// waiting for) or an item/result (a tool_result that landed
@@ -254,15 +254,15 @@ class HistoryEventPipeline
 						auto consumed = UserMessageConsumedEvent(
 							uuid: awaitingEchoUuids[0], consumed_as: "steering");
 						awaitingEchoUuids = awaitingEchoUuids[1 .. $];
-						auto ts = ta.translateHistoryLine(line, lineNum);
+						auto ts = ta.translateHistoryLine(line, lineNum, jsonlPath);
 						return stripTransientStatus([TranslatedEvent(toJson(consumed),
 							null, AbsTime.init, lineNum)] ~ ts);
 					}
-					return stripTransientStatus(ta.translateHistoryLine(line, lineNum));
+					return stripTransientStatus(ta.translateHistoryLine(line, lineNum, jsonlPath));
 				}
 				if (ta.isUserMessageLine(line))
 					userMsgFromJsonl++;
-				return stripTransientStatus(ta.translateHistoryLine(line, lineNum));
+				return stripTransientStatus(ta.translateHistoryLine(line, lineNum, jsonlPath));
 			}, maxBytes);
 		});
 		sw.stop();

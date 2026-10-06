@@ -147,19 +147,15 @@ private struct CancelParams
 	string sessionId;
 }
 
-// session/set_config_option (stable, ACP v1): the string variant of the
-// config value serializes as a plain {value: "<id>"} object with no type
-// tag on the wire.
-private struct ConfigOptionValue
-{
-	string value;
-}
-
+// session/set_config_option (stable, ACP v1): the select-option variant
+// (mode, model, thinking) carries the value as a plain JSON string —
+// verified against vibe-acp 2.25.8, which rejects a {value: "<id>"}
+// object with -32602 "Input should be a valid string".
 private struct SetConfigOptionParams
 {
 	string sessionId;
 	string configId;
-	ConfigOptionValue value;
+	string value;
 }
 
 // Persisted LLM-message format (S5): one message per line in
@@ -434,7 +430,12 @@ class VibeAcpProcess
 	/// never closes and hangs the event loop forever.
 	void shutdown()
 	{
-		if (dead)
+		// A failed handshake must not short-circuit: State.failed leaves
+		// the child running with stdin open, and startup failures route
+		// through VibeSession.handleStartupFailure, which relies on
+		// shutdown to terminate the process. Only an already-dead process
+		// (or a completed shutdown) is a no-op.
+		if (state_ == State.dead || process.dead)
 			return;
 		state_ = State.dead;
 
@@ -502,8 +503,12 @@ class VibeAcpProcess
 		state_ = State.initializing;
 		VibeInitializeParams params;
 		params.protocolVersion = 1;
-		params.clientCapabilities.fs.readTextFile = true;
-		params.clientCapabilities.fs.writeTextFile = true;
+		// Advertise only what IVibeAcpServer actually serves: the client fs
+		// capabilities are not implemented, and an agent that trusted a
+		// true advertisement would get method-not-found for every
+		// fs/read_text_file / fs/write_text_file request.
+		params.clientCapabilities.fs.readTextFile = false;
+		params.clientCapabilities.fs.writeTextFile = false;
 		params.clientCapabilities.terminal = false;
 		VibeClientInfo clientInfo;
 		clientInfo.name = "cydo";
@@ -555,6 +560,8 @@ class VibeAcpProcess
 
 version (unittest) private final class TestVibeAcpProcess : VibeAcpProcess
 {
+	int shutdownCount;
+
 	this(IConnection connection, bool sendInitialize)
 	{
 		super(connection, sendInitialize);
@@ -567,6 +574,7 @@ version (unittest) private final class TestVibeAcpProcess : VibeAcpProcess
 
 	override void shutdown()
 	{
+		shutdownCount++;
 		if (dead)
 			return;
 		state_ = State.dead;
@@ -592,7 +600,7 @@ version (unittest) private void initializeTestVibeAcpProcess(VibeAcpProcess serv
 		server.state_ = VibeAcpProcess.State.ready;
 }
 
-version (unittest) private VibeAcpProcess makeTestVibeAcpProcess(
+version (unittest) private TestVibeAcpProcess makeTestVibeAcpProcess(
 	IConnection connection, bool sendInitialize = false)
 {
 	return new TestVibeAcpProcess(connection, sendInitialize);
@@ -690,10 +698,16 @@ class VibeAgent : Agent
 	}
 
 	/// Write the profile bootstrap files when a native-history profile root
-	/// is present: config.toml (only when absent, so a shared user profile is
-	/// never clobbered) suppressing update checks and telemetry, pinning the
-	/// active model; trusted_folders.toml (only when absent and the task work
-	/// dir is absolute) so sessions start trusted.
+	/// is present: config.toml (only when absent, so an existing user
+	/// profile is never clobbered) suppressing update checks and telemetry,
+	/// and trusted_folders.toml (only when absent and the task work dir is
+	/// absolute) so sessions start trusted.
+	///
+	/// NOTE: the profile root is shared (typically the user's real
+	/// ~/.vibe), not per-task — the first CyDo task bootstraps these files
+	/// for every later vibe use, CyDo or not. The per-task model is not
+	/// pinned here: it is applied per session via the `model` config
+	/// option (see applySessionOptions).
 	private void bootstrapVibeProfile(ProcessLaunch launch, SessionConfig config)
 	{
 		if (launch.nativeHistoryProfile.root.length == 0)
@@ -709,12 +723,9 @@ class VibeAgent : Agent
 		auto configPath = buildPath(root, "config.toml");
 		if (!exists(configPath))
 		{
-			string contents = "# managed by CyDo — per-task agent profile\n"
+			string contents = "# managed by CyDo — shared Vibe profile bootstrap\n"
 				~ "enable_update_checks = false\n"
 				~ "enable_telemetry = false\n";
-			auto model = resolveModelSpec(config.model).model;
-			if (model.length > 0)
-				contents ~= "active_model = \"" ~ model ~ "\"\n";
 			write(configPath, contents);
 		}
 
@@ -724,7 +735,8 @@ class VibeAgent : Agent
 			auto workDir = launch.workDir.length > 0
 				? launch.workDir : config.workDir;
 			if (workDir.isAbsolute)
-				write(trustedPath, "trusted = [\"" ~ workDir ~ "\"]\n");
+				write(trustedPath, "trusted = [\"" ~ tomlEscapeBasicString(workDir)
+					~ "\"]\n");
 		}
 	}
 
@@ -955,13 +967,50 @@ class VibeAgent : Agent
 	{
 	}
 
+	/// Read a persisted user-line image attachment as base64. The backend
+	/// is unsandboxed while the profile dir is writable inside the agent
+	/// sandbox, so a crafted history line must not be able to make the
+	/// backend read an arbitrary host file (or block on a FIFO, or eat
+	/// memory on /dev/zero): only a regular file that resolves, after
+	/// realpath, inside the session dir holding the history file is
+	/// inlined, with a size cap. Returns null otherwise.
+	private static string readHistoryImageAttachment(string imagePath,
+		string historyPath)
+	{
+		import std.base64 : Base64;
+		import std.file : getSize, isFile, read;
+		import std.path : dirName;
+		import ae.sys.file : realPath;
+
+		enum maxImageBytes = 32 * 1024 * 1024;
+		if (imagePath.length == 0 || historyPath.length == 0)
+			return null;
+		try
+		{
+			auto sessionDir = realPath(dirName(historyPath));
+			auto resolved = realPath(imagePath); // throws when the path is missing
+			if (!resolved.isFile || !resolved.startsWith(sessionDir ~ "/"))
+				return null;
+			if (getSize(resolved) > maxImageBytes)
+				return null;
+			auto bytes = read(resolved);
+			return cast(string) Base64.encode(cast(ubyte[]) bytes);
+		}
+		catch (Exception)
+			return null;
+	}
+
 	// One persisted LLM message per line (S5); vibe-internal records carry
 	// injected=true and are not part of the transcript. Translation mirrors
 	// the live VibeSession shapes so history reload and live rendering agree:
 	// the vb-tool-<id> item ids pair tool results with their tool_use items,
 	// and a plain-content assistant message closes the turn because
 	// messages.jsonl has no explicit turn marker.
-	TranslatedEvent[] translateHistoryLine(string line, int lineNum)
+	// historyPath gates image inlining: persisted image paths must resolve
+	// inside the session dir that holds the history file (see
+	// readHistoryImageAttachment).
+	TranslatedEvent[] translateHistoryLine(string line, int lineNum,
+		string historyPath = null)
 	{
 		import std.format : format;
 
@@ -1014,26 +1063,23 @@ class VibeAgent : Agent
 				ContentBlock[] content = [cb];
 				// Persisted images are session-dir attachment files; inline
 				// them back as base64 blocks so the reloaded transcript shows
-				// what the model saw. A missing attachment degrades to the
-				// text-only message.
+				// what the model saw. A path outside the session dir, a
+				// non-regular file or an oversized one is skipped silently —
+				// the message degrades to text-only.
 				foreach (ref image; ev.images)
 				{
 					if (image.source.path.length == 0)
 						continue;
-					try
-					{
-						import std.base64 : Base64;
-						import std.file : read;
-						auto bytes = read(image.source.path);
-						auto encoded = Base64.encode(cast(ubyte[]) bytes);
-						ContentBlock imageBlock;
-						imageBlock.type = "image";
-						imageBlock.data = cast(string) encoded;
-						imageBlock.media_type = image.mime_type.length > 0
-							? image.mime_type : "image/png";
-						content ~= imageBlock;
-					}
-					catch (Exception) {}
+					auto encoded = readHistoryImageAttachment(
+						image.source.path, historyPath);
+					if (encoded.length == 0)
+						continue;
+					ContentBlock imageBlock;
+					imageBlock.type = "image";
+					imageBlock.data = encoded;
+					imageBlock.media_type = image.mime_type.length > 0
+						? image.mime_type : "image/png";
+					content ~= imageBlock;
 				}
 				ItemStartedEvent startEv;
 				startEv.item_id = "vb-hist-user-" ~ anchor;
@@ -1109,21 +1155,23 @@ class VibeAgent : Agent
 								? call.function_.arguments : `{}`);
 						events ~= TranslatedEvent(toJson(toolStartEv), line);
 					}
-					// A tool_calls-only assistant line is one model segment:
-					// close it with turn/stop like claude's per-message-stop
-					// shape, so the frontend ends the streaming message here
-					// and the following plain-text line opens its own message
-					// (and raw-source span) instead of merging with the tool
-					// segment.
-					if (ev.content.length == 0)
-					{
-						TurnStopEvent toolStopEv;
-						events ~= TranslatedEvent(toJson(toolStopEv), line);
-					}
+					// A tool_calls segment ends the streaming message
+					// whether or not text preceded it in the same line
+					// (like claude's per-message-stop shape), so the
+					// frontend ends the message here and the following
+					// plain-text line opens its own message (and
+					// raw-source span) instead of merging with the tool
+					// segment. The turn itself is still mid-flight: the
+					// tool results and the turn's real end follow.
+					TurnStopEvent toolStopEv;
+					events ~= TranslatedEvent(toJson(toolStopEv), line);
 				}
-				// A plain-content assistant message terminates the turn:
-				// synthesize the live protocol's turn/stop + turn/result pair.
-				if (ev.content.length > 0)
+				// A plain-content assistant line with no tool calls
+				// terminates the turn: synthesize the live protocol's
+				// turn/stop + turn/result pair. Text plus tool_calls in one
+				// line is mid-turn, so no turn/result is synthesized here.
+				if (ev.content.length > 0
+					&& !(ev.tool_calls.json.length > 0 && ev.tool_calls.json != "null"))
 				{
 					TurnStopEvent stopEv;
 					events ~= TranslatedEvent(toJson(stopEv), line);
@@ -1224,9 +1272,97 @@ class VibeAgent : Agent
 	InterruptedToolCallRepair repairInterruptedToolCall(string[] lines, string toolName,
 		string resultText)
 	{
-		// Vibe appends the tool record only after the tool settles, so an
-		// interrupted call leaves no partial record to repair.
-		return null;
+		// CyDo interrupts the session right after a successful
+		// continuation MCP call so the agent yields; vibe persists the
+		// interrupted call as an assistant tool_calls line plus a
+		// role:"tool" record whose content carries the
+		// `<user_cancellation>` marker (verified against vibe-acp
+		// 2.25.8). Rewrite that record to the intended result so the
+		// resumed context reports the successful switch instead of a
+		// user cancellation — mirroring the claude driver's rejection
+		// repair. Returns null when the expected shape is not present
+		// (e.g. the result was already recorded before the interrupt),
+		// leaving the file untouched.
+		import std.algorithm : canFind, startsWith;
+		import std.json : JSONType, JSONValue, parseJSON;
+
+		// The caller passes the claude-style full MCP name
+		// (mcp__cydo__SwitchMode); vibe persists the vibe-side
+		// `cydo_SwitchMode` tool name.
+		string canonical = toolName;
+		if (canonical.startsWith("mcp__cydo__"))
+			canonical = canonical["mcp__cydo__".length .. $];
+		string vibeToolName = "cydo_" ~ canonical;
+
+		string toolCallId;
+		foreach (line; lines)
+		{
+			JSONValue record;
+			try
+				record = parseJSON(line);
+			catch (Exception)
+				continue;
+			if (record.type != JSONType.object)
+				continue;
+			auto role = "role" in record.object
+				&& record.object["role"].type == JSONType.string
+				? record.object["role"].str : null;
+			auto toolCalls = "tool_calls" in record.object
+				&& record.object["tool_calls"].type == JSONType.array
+				? record.object["tool_calls"].array : null;
+			if (role != "assistant" || toolCalls is null)
+				continue;
+			foreach (ref call; toolCalls)
+			{
+				if (call.type != JSONType.object || !("function" in call.object))
+					continue;
+				auto function_ = call.object["function"];
+				if (function_.type != JSONType.object
+					|| !("name" in function_.object)
+					|| function_.object["name"].type != JSONType.string)
+					continue;
+				if (function_.object["name"].str == vibeToolName
+					&& "id" in call.object
+					&& call.object["id"].type == JSONType.string)
+					toolCallId = call.object["id"].str;
+			}
+		}
+		if (toolCallId.length == 0)
+			return null;
+
+		string[] rewritten;
+		bool repaired = false;
+		foreach (line; lines)
+		{
+			JSONValue record;
+			try
+				record = parseJSON(line);
+			catch (Exception)
+			{
+				rewritten ~= line;
+				continue;
+			}
+			if (!repaired && record.type == JSONType.object
+				&& "role" in record.object
+				&& record.object["role"].type == JSONType.string
+				&& record.object["role"].str == "tool"
+				&& "tool_call_id" in record.object
+				&& record.object["tool_call_id"].type == JSONType.string
+				&& record.object["tool_call_id"].str == toolCallId
+				&& "content" in record.object
+				&& record.object["content"].type == JSONType.string
+				&& record.object["content"].str.canFind("<user_cancellation>"))
+			{
+				record.object["content"] = JSONValue(resultText);
+				rewritten ~= record.toString();
+				repaired = true;
+			}
+			else
+				rewritten ~= line;
+		}
+		if (!repaired)
+			return null;
+		return new InterruptedToolCallRepair(rewritten);
 	}
 
 	bool forkIdMatchesLine(string line, int lineNum, string forkId)
@@ -1468,22 +1604,14 @@ class VibeAgent : Agent
 		// consulted here.
 		auto vibeBin = oneShotExecutableName(launch.sandbox.env);
 
-		string[string] env = [
-			"PATH": environment.get("PATH", ""),
-			"HOME": environment.get("HOME", ""),
-		];
-
 		auto spec = resolveModelSpec(modelClass);
-		// The CLI has no --model flag; VIBE_ACTIVE_MODEL overrides any config
-		// field (verified against vibe 2.25.4–2.25.8). An empty alias leaves it unset
-		// so vibe uses its own configured default.
-		if (spec.model.length > 0)
-			env["VIBE_ACTIVE_MODEL"] = spec.model;
+		string[string] env = buildVibeOneShotEnv(spec.model);
 		auto args = buildVibeOneShotArgs(vibeBin, prompt, launch);
 
-		// Unsanboxed: pass the minimal env above. Sanboxed: the child inherits
-		// the parent environment (cmdPrefix carries the sandbox settings), so
-		// the override needs a full copy of it to survive there.
+		// Unsandboxed: pass the minimal env above. Sandboxed: the child
+		// inherits the parent environment (cmdPrefix carries the sandbox
+		// settings), so the override needs a full copy of it to survive
+		// there.
 		string[string] procEnv;
 		if (launch.cmdPrefix is null)
 			procEnv = env;
@@ -1541,11 +1669,59 @@ private static string[] buildVibeOneShotArgs(string vibeBin, string prompt,
 		"--prompt", prompt,
 		"--output", "text",
 		"--max-turns", "1",
-		"--yolo",
+		// Titles and suggestions are generated from conversation content,
+		// which may include untrusted file or web text. Mirror the claude
+		// driver's `--tools ""` no-tools one-shot: --enabled-tools with a
+		// name that matches no tool disables every tool in programmatic
+		// mode (verified against vibe 2.25.8), so no tool call can run on
+		// the host. --yolo (auto-approve everything) is deliberately not
+		// used.
+		"--enabled-tools", "__cydo_no_tools__",
 	];
 	if (launch.cmdPrefix !is null)
 		args = launch.cmdPrefix ~ args;
 	return args;
+}
+
+/// Minimal environment for the unsandboxed one-shot child. PATH and HOME
+/// always ride along; vibe's provider reachability keys (API key, profile
+/// root, proxies) pass through when set so users who configure the
+/// interactive path via env instead of ~/.vibe/.env keep working one-shot
+/// completions — the same passthrough list as configureSandbox. The
+/// sandboxed child inherits the parent environment wholesale, so it needs
+/// only the model override forced.
+private static string[string] buildVibeOneShotEnv(string model)
+{
+	import std.process : environment;
+
+	string[string] env = [
+		"PATH": environment.get("PATH", ""),
+		"HOME": environment.get("HOME", ""),
+	];
+	foreach (key; ["MISTRAL_API_KEY", "VIBE_HOME", "HTTPS_PROXY", "NO_PROXY"])
+	{
+		auto value = environment.get(key, "");
+		if (value.length > 0)
+			env[key] = value;
+	}
+	// The CLI has no --model flag; VIBE_ACTIVE_MODEL overrides any config
+	// field (verified against vibe 2.25.4–2.25.8). An empty alias leaves it
+	// unset so vibe uses its own configured default.
+	if (model.length > 0)
+		env["VIBE_ACTIVE_MODEL"] = model;
+	return env;
+}
+
+/// Escape a value for a TOML basic ("…") string: backslash and double
+/// quote are escaped so paths spliced into trusted_folders.toml cannot
+/// break out of the string or corrupt the file.
+private static string tomlEscapeBasicString(string value)
+{
+	import std.array : replace;
+
+	return value
+		.replace("\\", "\\\\")
+		.replace("\"", "\\\"");
 }
 
 // ---------------------------------------------------------------------------
@@ -1611,33 +1787,55 @@ private string buildLoadSessionParams(int tid, string sessionId, string workDir,
 	return toJson(params);
 }
 
-/// Apply the launch `effort` parameter as vibe's `thinking` config option
-/// (off/low/medium/high/max per S8) once the session exists, then hand
-/// control to the ready path. An empty effort leaves vibe's configured
-/// default untouched. A rejected option fails the startup — mirroring how
-/// an invalid effort value fails the claude CLI at spawn.
-private void applyEffortOption(VibeAcpProcess server, string sessionId,
-	SessionConfig config, void delegate() onReady, void delegate(Exception) onFail)
+/// Apply CyDo's per-session model and effort once the session exists, then
+/// hand control to the ready path. The model rides the `model` config
+/// option (S8: a select option on session/new, verified accepted by
+/// session/set_config_option against vibe-acp 2.25.8) so each task's
+/// resolved model class is honoured per session instead of depending on
+/// the profile's global `active_model`. The launch `effort` parameter maps
+/// to vibe's `thinking` option (off/low/medium/high/max per S8). Empty
+/// values leave vibe's configured default untouched. A rejected option
+/// fails the startup — mirroring how an invalid model or effort value
+/// fails the claude CLI at spawn (handleStartupFailure then terminates
+/// the leaked process).
+private void applySessionOptions(VibeAcpProcess server, string sessionId,
+	string model, SessionConfig config, void delegate() onReady,
+	void delegate(Exception) onFail)
 {
-	if (config.effort.length == 0)
+	void sendOption(string configId, string value, void delegate() next)
 	{
-		onReady();
+		SetConfigOptionParams params;
+		params.sessionId = sessionId;
+		params.configId = configId;
+		params.value = value;
+		server.sendRequest("session/set_config_option", toJson(params))
+			.then((JsonRpcResponse resp) {
+				if (resp.isError)
+				{
+					onFail(new Exception(
+						"session/set_config_option error: " ~ resp.error.get.message));
+					return;
+				}
+				next();
+			}, (Exception e) { onFail(e); });
+	}
+
+	void applyEffort()
+	{
+		if (config.effort.length == 0)
+		{
+			onReady();
+			return;
+		}
+		sendOption("thinking", config.effort, onReady);
+	}
+
+	if (model.length == 0)
+	{
+		applyEffort();
 		return;
 	}
-	SetConfigOptionParams params;
-	params.sessionId = sessionId;
-	params.configId = "thinking";
-	params.value = ConfigOptionValue(config.effort);
-	server.sendRequest("session/set_config_option", toJson(params))
-		.then((JsonRpcResponse resp) {
-			if (resp.isError)
-			{
-				onFail(new Exception(
-					"session/set_config_option error: " ~ resp.error.get.message));
-				return;
-			}
-			onReady();
-		}, (Exception e) { onFail(e); });
+	sendOption("model", model, &applyEffort);
 }
 
 /// Read a session dir's meta.json (session_id, origin_directory, title).
@@ -1705,7 +1903,7 @@ private VibeSession attachSession(VibeAcpProcess server, int tid,
 							"session/load error: " ~ resp.error.get.message));
 						return;
 					}
-					applyEffortOption(server, resumeSessionId, config, {
+					applySessionOptions(server, resumeSessionId, model, config, {
 						session.onSessionStarted();
 					}, (Exception e) {
 						session.stopReplay();
@@ -1748,7 +1946,7 @@ private VibeSession attachSession(VibeAcpProcess server, int tid,
 					}
 					session.adoptSessionId(sessionId);
 					server.registerSession(sessionId, session);
-					applyEffortOption(server, sessionId, config, {
+					applySessionOptions(server, sessionId, model, config, {
 						session.onSessionStarted();
 					}, (Exception e) {
 						server.unregisterSession(sessionId);
@@ -2316,6 +2514,12 @@ class VibeSession : AgentSession, VibeSessionHandler
 	void handleStartupFailure(Exception error)
 	{
 		rejectUnsettledMessages(error);
+		// A startup failure leaves the vibe-acp child running with stdin
+		// open, and nothing else will stop it: stop()/closeStdin() return
+		// early once handleExit clears alive_ below. Terminate the process
+		// here so a failed resume, protocol mismatch or rejected session
+		// option does not leak one process per attempt.
+		server.shutdown();
 		handleExit(1);
 	}
 
@@ -2979,7 +3183,7 @@ version (unittest) private ReadyVibeFixture makeReadyVibeSession(int tid,
 {
 	auto connection = new TestVibeConnection;
 	auto server = makeTestVibeAcpProcess(connection);
-	auto session = attachSession(server, tid, null, "test-model",
+	auto session = attachSession(server, tid, null, "",
 		"/test/workdir", SessionConfig.init);
 	auto newRequest = connection.takeRequest("session/new");
 	auto sessionId = nativeSessionId.length > 0
@@ -3026,7 +3230,7 @@ unittest
 	agent.setModelAliases(null);
 	assert(agent.resolveModelSpec("").model == "");
 
-	// Interrupted tool call repair is inert in Part 2.
+	// An unrecognized history shape leaves the repair inert.
 	assert(agent.repairInterruptedToolCall([`{"type":"tool.execution_complete"}`],
 		"mcp__cydo__SwitchMode", "RESULT") is null);
 }
@@ -3045,8 +3249,10 @@ unittest
 	auto args = buildVibeOneShotArgs("vibe", "hello", launch);
 	assert(args == [
 		"vibe", "--prompt", "hello", "--output", "text",
-		"--max-turns", "1", "--yolo",
+		"--max-turns", "1", "--enabled-tools", "__cydo_no_tools__",
 	]);
+	// The no-tools completion never auto-approves tool calls.
+	assert(!args.canFind("--yolo"));
 	// vibe has no --model flag; the model travels via the VIBE_ACTIVE_MODEL
 	// env override set in completeOneShot.
 	assert(!args.canFind("--model"));
@@ -3054,7 +3260,7 @@ unittest
 	auto prefixed = buildVibeOneShotArgs("vibe", "hello", launch);
 	assert(prefixed == [
 		"bwrap", "vibe", "--prompt", "hello", "--output", "text",
-		"--max-turns", "1", "--yolo",
+		"--max-turns", "1", "--enabled-tools", "__cydo_no_tools__",
 	]);
 }
 
@@ -3220,8 +3426,10 @@ unittest
 
 	auto agent = new VibeAgent;
 
-	// Absolute work dir: config.toml suppresses updates and telemetry and pins
-	// the resolved active model; trusted_folders.toml trusts the work dir.
+	// Absolute work dir: config.toml suppresses updates and telemetry
+	// (the per-task model is NOT pinned here — it is applied per session
+	// via the `model` config option); trusted_folders.toml trusts the
+	// work dir.
 	auto profileA = buildPath(root, "profile-a");
 	ProcessLaunch launch;
 	launch.nativeHistoryProfile = NativeHistoryProfile(AgentDriver.vibe, profileA);
@@ -3232,7 +3440,7 @@ unittest
 	auto configToml = readText(buildPath(profileA, "config.toml"));
 	assert(configToml.canFind("enable_update_checks = false"));
 	assert(configToml.canFind("enable_telemetry = false"));
-	assert(configToml.canFind(`active_model = "mistral-medium-3.5"`));
+	assert(!configToml.canFind("active_model"));
 	assert(readText(buildPath(profileA, "trusted_folders.toml"))
 		== `trusted = ["/test/workdir"]` ~ "\n");
 
@@ -3258,7 +3466,8 @@ unittest
 	assert(readText(buildPath(profileC, "trusted_folders.toml"))
 		.canFind("/test/config-workdir"));
 
-	// Empty model: no active_model line is written.
+	// Empty model: nothing model-related is written either way (the model
+	// rides the per-session config option, not config.toml).
 	auto profileD = buildPath(root, "profile-d");
 	launch.nativeHistoryProfile = NativeHistoryProfile(AgentDriver.vibe, profileD);
 	launch.workDir = "/test/workdir";
@@ -3266,6 +3475,14 @@ unittest
 	config.workDir = null;
 	agent.bootstrapVibeProfile(launch, config);
 	assert(!readText(buildPath(profileD, "config.toml")).canFind("active_model"));
+
+	// A work dir needing TOML escaping is written as a valid basic string.
+	auto profileE = buildPath(root, "profile-e");
+	launch.nativeHistoryProfile = NativeHistoryProfile(AgentDriver.vibe, profileE);
+	launch.workDir = `/test/wi"rk\dir`;
+	agent.bootstrapVibeProfile(launch, config);
+	assert(readText(buildPath(profileE, "trusted_folders.toml"))
+		== `trusted = ["/test/wi\"rk\\dir"]` ~ "\n");
 
 	// Empty profile root: a no-op.
 	ProcessLaunch emptyLaunch;
@@ -3349,15 +3566,19 @@ unittest
 	auto initRequest = connection.takeRequest("initialize");
 	auto initParams = jsonParse!VibeInitializeParams(toJson(initRequest.params));
 	assert(initParams.protocolVersion == 1);
-	assert(initParams.clientCapabilities.fs.readTextFile);
-	assert(initParams.clientCapabilities.fs.writeTextFile);
+	// Client fs capabilities are advertised as false: the client-side
+	// fs/read_text_file and fs/write_text_file handlers are not
+	// implemented, and an agent that trusted a true advertisement would
+	// get method-not-found for every request.
+	assert(!initParams.clientCapabilities.fs.readTextFile);
+	assert(!initParams.clientCapabilities.fs.writeTextFile);
 	assert(!initParams.clientCapabilities.terminal);
 	assert(initParams.clientInfo.name == "cydo");
 	assert(initParams.clientInfo.version_ == "0.1.0");
 
 	string[] nativeIds;
 	string[] order;
-	auto session = attachSession(server, 1, null, "test-model", "/test/workdir",
+	auto session = attachSession(server, 1, null, "", "/test/workdir",
 		SessionConfig.init);
 	session.onNativeSessionStarted = (string sessionId) {
 		nativeIds ~= sessionId;
@@ -3398,7 +3619,7 @@ unittest
 	// session/prompt response is purely the turn boundary.
 	auto connection = new TestVibeConnection;
 	auto server = makeTestVibeAcpProcess(connection);
-	auto session = attachSession(server, 1, null, "test-model", "/test/workdir",
+	auto session = attachSession(server, 1, null, "", "/test/workdir",
 		SessionConfig.init);
 	string[] emitted;
 	session.onOutput = (TranslatedEvent event) {
@@ -3471,7 +3692,7 @@ unittest
 	// no-op once the echo completed.
 	auto connection = new TestVibeConnection;
 	auto server = makeTestVibeAcpProcess(connection);
-	auto session = attachSession(server, 1, null, "test-model", "/test/workdir",
+	auto session = attachSession(server, 1, null, "", "/test/workdir",
 		SessionConfig.init);
 	assert(session.supportsImages);
 	string[] emitted;
@@ -3538,7 +3759,7 @@ unittest
 
 	auto connection = new TestVibeConnection;
 	auto server = makeTestVibeAcpProcess(connection);
-	auto session = attachSession(server, 1, null, "test-model", "/test/workdir",
+	auto session = attachSession(server, 1, null, "", "/test/workdir",
 		SessionConfig.init);
 	assert(session.alive);
 	string[] emitted;
@@ -3731,7 +3952,7 @@ unittest
 	auto connection = new TestVibeConnection;
 	auto server = makeTestVibeAcpProcess(connection, true);
 	auto initRequest = connection.takeRequest("initialize");
-	auto session = attachSession(server, 5, null, "test-model", "/test/workdir",
+	auto session = attachSession(server, 5, null, "", "/test/workdir",
 		SessionConfig.init);
 	auto queued = new TestVibeSubmissionOutcome(
 		session.sendMessage([ContentBlock("text", "wait for initialize")],
@@ -3741,6 +3962,10 @@ unittest
 	connection.respond(initRequest, rejectedVibeResponse("initialize rejected"));
 	drainVibePromiseNextTicks();
 	assertVibeRejectedOnce(queued, "initialize rejected");
+	// The startup failure must terminate the process (the test double
+	// records shutdown; the real shutdown would close stdin, terminate
+	// and SIGKILL after a timeout) instead of leaking it with stdin open.
+	assert(server.shutdownCount == 1);
 	assert(server.state == VibeAcpProcess.State.failed && server.dead);
 	assert(!session.alive_);
 
@@ -3752,6 +3977,144 @@ unittest
 
 unittest
 {
+	// Per-session options: the resolved model rides the `model` config
+	// option before the `thinking` (effort) option, and the session only
+	// becomes ready once both are accepted.
+	auto connection = new TestVibeConnection;
+	auto server = makeTestVibeAcpProcess(connection);
+	SessionConfig config;
+	config.effort = "low";
+	auto session = attachSession(server, 21, null, "mock-model",
+		"/test/workdir", config);
+	auto newRequest = connection.takeRequest("session/new");
+	connection.respond(newRequest,
+		acceptedVibeResponse(`{"sessionId":"native-vibe-21"}`));
+	drainVibePromiseNextTicks();
+	assert(!session.sessionReady_);
+
+	auto modelRequest = connection.takeRequest("session/set_config_option");
+	auto modelParams = jsonParse!SetConfigOptionParams(
+		toJson(modelRequest.params));
+	assert(modelParams.sessionId == "native-vibe-21");
+	assert(modelParams.configId == "model"
+		&& modelParams.value == "mock-model");
+	connection.respond(modelRequest, acceptedVibeResponse());
+	drainVibePromiseNextTicks();
+	assert(!session.sessionReady_);
+
+	auto thinkingRequest = connection.takeRequest("session/set_config_option");
+	auto thinkingParams = jsonParse!SetConfigOptionParams(
+		toJson(thinkingRequest.params));
+	assert(thinkingParams.configId == "thinking"
+		&& thinkingParams.value == "low");
+	connection.respond(thinkingRequest, acceptedVibeResponse());
+	drainVibePromiseNextTicks();
+	assert(session.sessionReady_ && session.alive_);
+
+	// An empty model skips the option entirely (vibe's configured default
+	// applies) and only the effort option is sent.
+	auto connection2 = new TestVibeConnection;
+	auto server2 = makeTestVibeAcpProcess(connection2);
+	auto session2 = attachSession(server2, 22, null, "",
+		"/test/workdir", config);
+	auto newRequest2 = connection2.takeRequest("session/new");
+	connection2.respond(newRequest2,
+		acceptedVibeResponse(`{"sessionId":"native-vibe-22"}`));
+	drainVibePromiseNextTicks();
+	auto effortRequest = connection2.takeRequest("session/set_config_option");
+	auto effortParams = jsonParse!SetConfigOptionParams(
+		toJson(effortRequest.params));
+	assert(effortParams.configId == "thinking");
+	connection2.respond(effortRequest, acceptedVibeResponse());
+	drainVibePromiseNextTicks();
+	assert(session2.sessionReady_);
+}
+
+unittest
+{
+	// A rejected session option fails the startup and terminates the
+	// process instead of leaking it.
+	auto connection = new TestVibeConnection;
+	auto server = makeTestVibeAcpProcess(connection);
+	auto session = attachSession(server, 23, null, "nonexistent-model",
+		"/test/workdir", SessionConfig.init);
+	auto newRequest = connection.takeRequest("session/new");
+	connection.respond(newRequest,
+		acceptedVibeResponse(`{"sessionId":"native-vibe-23"}`));
+	drainVibePromiseNextTicks();
+	auto modelRequest = connection.takeRequest("session/set_config_option");
+	connection.respond(modelRequest,
+		rejectedVibeResponse("Unsupported config option"));
+	drainVibePromiseNextTicks();
+	assert(!session.alive_ && !session.sessionReady_);
+	assert(server.shutdownCount == 1);
+}
+
+unittest
+{
+	// One-shot completion runs without tools: --yolo is never passed and
+	// the no-tools sentinel rides --enabled-tools.
+	auto args = buildVibeOneShotArgs("vibe", "summarize this", ProcessLaunch.init);
+	assert(!args.canFind("--yolo"));
+	bool sentinelFollowsFlag = false;
+	foreach (i, arg; args)
+		if (arg == "--enabled-tools" && i + 1 < args.length)
+			sentinelFollowsFlag = args[i + 1] == "__cydo_no_tools__";
+	assert(sentinelFollowsFlag);
+	assert(args.canFind("--max-turns") && args.canFind("1"));
+}
+
+unittest
+{
+	// The unsandboxed one-shot env carries the provider reachability
+	// passthrough keys and the model override.
+	import std.process : environment;
+
+	environment["NO_PROXY"] = "vibe-one-shot-env-test";
+	scope (exit)
+		environment.remove("NO_PROXY");
+	auto env = buildVibeOneShotEnv("mock-model");
+	assert(env["VIBE_ACTIVE_MODEL"] == "mock-model");
+	assert(env["NO_PROXY"] == "vibe-one-shot-env-test");
+	assert("PATH" in env && "HOME" in env);
+
+	// An empty model leaves the override unset so vibe's configured
+	// default applies.
+	auto noModel = buildVibeOneShotEnv("");
+	assert("VIBE_ACTIVE_MODEL" !in noModel);
+}
+
+unittest
+{
+	// The interrupted-tool-call repair rewrites the persisted user-
+	// cancellation tool record to the intended result.
+	auto agent = new VibeAgent;
+	auto call = `{"role": "assistant", "injected": false, "message_id": "a1", "tool_calls": [{"id": "call_1", "index": 0, "type": "function", "function": {"name": "cydo_SwitchMode", "arguments": "{\"mode\":\"write\"}"}}]}`;
+	auto cancelled = `{"role": "tool", "content": "<user_cancellation>Tool execution interrupted by user.</user_cancellation>", "injected": false, "name": "cydo_SwitchMode", "tool_call_id": "call_1"}`;
+	auto user = `{"role": "user", "content": "call switchmode write", "injected": false, "message_id": "u1"}`;
+
+	auto repaired = agent.repairInterruptedToolCall(
+		[user, call, cancelled], "mcp__cydo__SwitchMode",
+		"Mode switch to 'write' successful.");
+	assert(repaired !is null);
+	assert(repaired.lines.length == 3);
+	assert(repaired.lines[0] == user && repaired.lines[1] == call);
+	assert(repaired.lines[2].canFind("Mode switch to 'write' successful."));
+	assert(!repaired.lines[2].canFind("<user_cancellation>"));
+
+	// A result recorded before the interrupt carries the success text
+	// already: no cancellation marker, nothing to repair.
+	auto settled = `{"role": "tool", "content": "Mode switch to 'write' successful.", "injected": false, "name": "cydo_SwitchMode", "tool_call_id": "call_1"}`;
+	assert(agent.repairInterruptedToolCall([user, call, settled],
+		"mcp__cydo__SwitchMode", "x") is null);
+
+	// No matching tool call leaves the file untouched.
+	assert(agent.repairInterruptedToolCall([user, cancelled],
+		"mcp__cydo__SwitchMode", "x") is null);
+}
+
+unittest
+{
 	void exerciseSessionSetupFailure(string resumeSessionId,
 		string expectedMethod)
 	{
@@ -3759,7 +4122,7 @@ unittest
 		auto server = makeTestVibeAcpProcess(connection);
 		auto sessionId = resumeSessionId.length > 0
 			? resumeSessionId : "setup-failure";
-		auto session = attachSession(server, 6, resumeSessionId, "test-model",
+		auto session = attachSession(server, 6, resumeSessionId, "",
 			"/test/workdir", SessionConfig.init);
 		auto setupRequest = connection.takeRequest(expectedMethod);
 		if (resumeSessionId.length > 0)
@@ -3792,6 +4155,8 @@ unittest
 		auto expectedError = expectedMethod ~ " error: setup rejected";
 		assertVibeRejectedOnce(queued, expectedError);
 		assert(!session.alive_ && !session.sessionReady_);
+		// The failed setup must have terminated the process.
+		assert(server.shutdownCount == 1);
 		assert(session.pendingMessages.length == 0
 			&& session.expectedUserMessages.length == 0);
 		assert(connection.sentMessages.length == 0);
@@ -3820,7 +4185,7 @@ unittest
 	// The response ends replay mode and emits the synthetic session/init.
 	auto connection = new TestVibeConnection;
 	auto server = makeTestVibeAcpProcess(connection);
-	auto session = attachSession(server, 8, "native-vibe-8", "test-model",
+	auto session = attachSession(server, 8, "native-vibe-8", "",
 		"/test/workdir", SessionConfig.init);
 	auto loadRequest = connection.takeRequest("session/load");
 	auto loadParams = jsonParse!LoadSessionParams(toJson(loadRequest.params));
@@ -4282,9 +4647,11 @@ unittest
 		auto bytes = cast(ubyte[]) "png-bytes";
 		write(attPath, bytes);
 		auto expectedB64 = cast(string) Base64.encode(bytes);
+		auto historyPath = buildPath(attDir, "messages.jsonl");
 
 		auto withImage = agent.translateHistoryLine(
-			`{"role": "user", "content": "describe this image", "injected": false, "message_id": "u2", "images": [{"source": {"kind": "file", "path": "` ~ attPath ~ `"}, "alias": "pasted-image.png", "mime_type": "image/png"}]}`, 4);
+			`{"role": "user", "content": "describe this image", "injected": false, "message_id": "u2", "images": [{"source": {"kind": "file", "path": "` ~ attPath ~ `"}, "alias": "pasted-image.png", "mime_type": "image/png"}]}`, 4,
+			historyPath);
 		assert(withImage.length == 1);
 		auto imageItem = jsonParse!ItemStartedEvent(withImage[0].translated);
 		assert(imageItem.content.length == 2);
@@ -4294,12 +4661,43 @@ unittest
 			&& imageItem.content[1].data == expectedB64
 			&& imageItem.content[1].media_type == "image/png");
 
+		// A missing attachment degrades to the text-only message.
 		auto missing = agent.translateHistoryLine(
-			`{"role": "user", "content": "describe this image", "injected": false, "message_id": "u3", "images": [{"source": {"kind": "file", "path": "` ~ buildPath(attDir, "gone.png") ~ `"}, "mime_type": "image/png"}]}`, 5);
+			`{"role": "user", "content": "describe this image", "injected": false, "message_id": "u3", "images": [{"source": {"kind": "file", "path": "` ~ buildPath(attDir, "gone.png") ~ `"}, "mime_type": "image/png"}]}`, 5,
+			historyPath);
 		assert(missing.length == 1);
 		auto missingItem = jsonParse!ItemStartedEvent(missing[0].translated);
 		assert(missingItem.content.length == 1
 			&& missingItem.content[0].type == "text");
+
+		// A path outside the session dir is never read — the backend is
+		// unsandboxed and a crafted history line must not be able to make
+		// it read arbitrary host files.
+		auto outsideDir = buildPath(tempDir(), "cydo-vibe-hist-image-outside");
+		if (exists(outsideDir))
+			rmdirRecurse(outsideDir);
+		mkdirRecurse(outsideDir);
+		scope (exit)
+			if (exists(outsideDir))
+				rmdirRecurse(outsideDir);
+		auto outsidePath = buildPath(outsideDir, "secret.png");
+		write(outsidePath, cast(ubyte[]) "secret");
+		auto outside = agent.translateHistoryLine(
+			`{"role": "user", "content": "leak this", "injected": false, "message_id": "u4", "images": [{"source": {"kind": "file", "path": "` ~ outsidePath ~ `"}, "mime_type": "image/png"}]}`, 6,
+			historyPath);
+		assert(outside.length == 1);
+		auto outsideItem = jsonParse!ItemStartedEvent(outside[0].translated);
+		assert(outsideItem.content.length == 1
+			&& outsideItem.content[0].type == "text");
+
+		// No history path (tail-side translation without a resolved file)
+		// never inlines images either.
+		auto unrooted = agent.translateHistoryLine(
+			`{"role": "user", "content": "describe this image", "injected": false, "message_id": "u5", "images": [{"source": {"kind": "file", "path": "` ~ attPath ~ `"}, "mime_type": "image/png"}]}`, 7);
+		assert(unrooted.length == 1);
+		auto unrootedItem = jsonParse!ItemStartedEvent(unrooted[0].translated);
+		assert(unrootedItem.content.length == 1
+			&& unrootedItem.content[0].type == "text");
 	}
 
 	// Without a message_id the line number becomes the anchor.
@@ -4327,8 +4725,8 @@ unittest
 	assert(turnResult.subtype == "success" && turnResult.result == "OK");
 
 	// A tool_calls message emits tool_use items with the live naming
-	// contract plus a segment-closing turn/stop (the turn itself stays open:
-	// no turn/result without content).
+	// contract plus a segment-closing turn/stop (the turn itself stays
+	// open: no turn/result is synthesized for a tool_calls line).
 	auto toolCall = agent.translateHistoryLine(
 		`{"role": "assistant", "injected": false, "message_id": "a2", "tool_calls": [{"id": "call_1", "index": 0, "type": "function", "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}}]}`, 5);
 	assert(toolCall.length == 2);
@@ -4338,6 +4736,24 @@ unittest
 	assert(toolItem.name == "bash" && toolItem.tool_server is null);
 	assert(toolItem.input.json == `{"command":"ls"}`);
 	assert(jsonParse!TurnStopEvent(toolCall[1].translated).type == "turn/stop");
+
+	// A mixed content + tool_calls line is one mid-turn segment: the text
+	// items, the tool_use item, and a single segment-closing turn/stop —
+	// but no turn/result, which would prematurely end the turn before
+	// the tool results and the turn's real end.
+	auto mixed = agent.translateHistoryLine(
+		`{"role": "assistant", "content": "Let me check.", "injected": false, "message_id": "a4", "tool_calls": [{"id": "call_3", "index": 0, "type": "function", "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}}]}`, 8);
+	assert(mixed.length == 4);
+	auto mixedText = jsonParse!ItemStartedEvent(mixed[0].translated);
+	assert(mixedText.item_type == "text" && mixedText.item_id == "vb-hist-text-a4");
+	auto mixedTextDone = jsonParse!ItemCompletedEvent(mixed[1].translated);
+	assert(mixedTextDone.item_id == "vb-hist-text-a4"
+		&& mixedTextDone.text == "Let me check.");
+	auto mixedTool = jsonParse!ItemStartedEvent(mixed[2].translated);
+	assert(mixedTool.item_type == "tool_use" && mixedTool.item_id == "vb-tool-call_3");
+	assert(jsonParse!TurnStopEvent(mixed[3].translated).type == "turn/stop");
+	foreach (event; mixed)
+		assert(!event.translated.canFind(`"type":"turn/result"`));
 
 	// cydo_<tool> MCP names decompose into the canonical name + server.
 	auto cydoCall = agent.translateHistoryLine(
@@ -4486,7 +4902,7 @@ unittest
 	auto server = makeTestVibeAcpProcess(connection);
 	SessionConfig config;
 	config.effort = "high";
-	auto session = attachSession(server, 12, null, "test-model",
+	auto session = attachSession(server, 12, null, "",
 		"/test/workdir", config);
 
 	string[] emitted;
@@ -4505,7 +4921,7 @@ unittest
 	auto optionParams = jsonParse!SetConfigOptionParams(toJson(optionRequest.params));
 	assert(optionParams.sessionId == "effort-session");
 	assert(optionParams.configId == "thinking");
-	assert(optionParams.value.value == "high");
+	assert(optionParams.value == "high");
 	assert(emitted.length == 0);
 
 	connection.respond(optionRequest, acceptedVibeResponse(`{"configOptions":[]}`));
@@ -4527,7 +4943,7 @@ unittest
 	auto server = makeTestVibeAcpProcess(connection);
 	SessionConfig config;
 	config.effort = "banana";
-	auto session = attachSession(server, 14, null, "test-model",
+	auto session = attachSession(server, 14, null, "",
 		"/test/workdir", config);
 
 	string[] emitted;

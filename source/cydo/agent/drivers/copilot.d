@@ -379,7 +379,7 @@ class CopilotAgent : Agent
 
 	void resetHistoryReplay() {} // no state to reset for Copilot
 
-	TranslatedEvent[] translateHistoryLine(string line, int lineNum)
+	TranslatedEvent[] translateHistoryLine(string line, int lineNum, string historyPath = null)
 	{
 		import std.algorithm : canFind;
 		import std.uuid : randomUUID;

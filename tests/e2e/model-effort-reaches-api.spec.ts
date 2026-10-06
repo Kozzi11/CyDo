@@ -110,3 +110,36 @@ test(
       .toBe("low");
   },
 );
+
+test(
+  "Vibe per-task model reaches the outbound chat-completions request",
+  { tag: "@vibe-only" },
+  async ({ page, agentType }) => {
+    const capturePath = process.env.MOCK_OPENAI_CAPTURE;
+    if (!capturePath) {
+      throw new Error("MOCK_OPENAI_CAPTURE is unset");
+    }
+    const probeText = "vibe model e2e probe";
+    const initialCount = readCaptureRecords<OpenAICaptureRecord>(capturePath).length;
+
+    await enterSession(page);
+    await sendMessage(page, probeText);
+    await expect(assistantText(page, probeText)).toBeVisible({
+      timeout: responseTimeout(agentType),
+    });
+
+    // CyDo resolves the task type's model class and applies it per session
+    // via the `model` ACP config option; vibe then routes the session
+    // through the aliased model (config.toml [[models]] name), which is
+    // what reaches the mock API.
+    await expect
+      .poll(
+        () =>
+          readCaptureRecords<OpenAICaptureRecord>(capturePath, initialCount).find(
+            (record) => record.userText?.includes(probeText) ?? false,
+          )?.model ?? null,
+        { timeout: responseTimeout(agentType) },
+      )
+      .toBe("mock-model");
+  },
+);

@@ -23,6 +23,19 @@ suggestions: false
 workspaces:
   local:
     root: /tmp/cydo-test-workspace
+# Vibe sessions apply the resolved per-task model via vibe's model config
+# option, and the real vibe-acp validates it against its catalog — the mock
+# profile only defines the "mock" alias, so keep the aliases in this
+# replacement config (see flake.nix).
+agents:
+  vibe:
+    model_aliases:
+      small:
+        model: mock
+      medium:
+        model: mock
+      large:
+        model: mock
 `,
   );
   // Give the backend's inotify watcher time to reload the config.

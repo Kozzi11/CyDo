@@ -38,8 +38,7 @@ async function getSuggestionTexts(
 // Index 1 = session header ("[Session: N user messages, M tool uses]")
 // Index 2 = conversation body (abbreviated history body)
 
-test("multi-turn suggestion context has no spurious [...] markers",
-    async ({
+test("multi-turn suggestion context has no spurious [...] markers", async ({
   page,
   agentType,
 }) => {
@@ -83,8 +82,7 @@ test("multi-turn suggestion context has no spurious [...] markers",
   ).toBeGreaterThanOrEqual(3);
 });
 
-test("suggestion context truncates by turns not entries",
-    async ({
+test("suggestion context truncates by turns not entries", async ({
   page,
   agentType,
 }) => {

@@ -112,6 +112,8 @@ struct JsonlTracker
 		string raw = null, int sourceLine = 0, bool isContextBootstrap = false,
 		bool registeredLocal = false)
 	{
+		import std.logger : tracef;
+
 		import ae.utils.json : JSONOptional, JSONPartial, jsonParse;
 		@JSONPartial static struct Probe { string type; @JSONOptional string item_type;
 			@JSONOptional string uuid; @JSONOptional string item_id;
@@ -126,13 +128,17 @@ struct JsonlTracker
 		else if (p.type == "turn/stop" && !p.is_sidechain && p.parent_tool_use_id.length == 0)
 			kind = PersistedHistoryBoundaryKind.agent_turn;
 		else return;
-		if (tid !in boundaryState)
-			boundaryState[tid] = BoundaryReconcileState.init;
 		// Tasks without a live history watch (no live context attached) have
 		// no persisted counterpart to reconcile against — skip boundary
-		// bookkeeping entirely.
+		// bookkeeping entirely (without creating per-task state).
 		if (tid !in liveContexts)
+		{
+			tracef("noteLiveBoundaryCandidate[%d]: no live context, skipping boundary bookkeeping",
+				tid);
 			return;
+		}
+		if (tid !in boundaryState)
+			boundaryState[tid] = BoundaryReconcileState.init;
 		if (requireLiveContext(tid).agent.driver == AgentDriver.codex && isContextBootstrap
 			&& kind == PersistedHistoryBoundaryKind.user)
 			return;

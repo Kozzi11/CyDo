@@ -164,7 +164,7 @@ string exportTaskData(Persistence.TaskRow[] taskRows, ref CydoConfig config,
 			delegate TranslatedEvent[](string line, int lineNum) {
 				if (lineNum in rollbackSkipLines)
 					return [];
-				return agent.translateHistoryLine(line, lineNum);
+				return agent.translateHistoryLine(line, lineNum, jsonlPath);
 			});
 
 		string[] evList;

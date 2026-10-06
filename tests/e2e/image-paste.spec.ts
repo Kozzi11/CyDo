@@ -70,6 +70,17 @@ test("paste image into input, send, and verify round-trip", {
 
   // Step 7: Verify image preview was cleared from input area after send
   await expect(page.locator(".image-preview img")).not.toBeVisible();
+
+  // Step 8: The image survives history reload: the persisted user line
+  // re-inlines the session attachment (vibe stores it as a session-dir
+  // file; claude persists the base64 block inline).
+  await page.reload();
+  await expect(
+    page.locator(".message.user-message .user-image"),
+  ).toBeVisible({ timeout: responseTimeout(agentType) });
+  await expect(page.locator(".message.user-message .user-text")).toContainText(
+    "describe this image",
+  );
 });
 
 test("remove image from preview before sending", async ({

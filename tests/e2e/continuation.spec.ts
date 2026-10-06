@@ -236,9 +236,10 @@ function assertRepairedContinuationHistory(
   }
 
   for (const fragment of rejectedContinuationHistoryFragments) {
-    expect(rawHistory, `Unexpected stale continuation history: ${fragment}`).not.toContain(
-      fragment,
-  );
+    expect(
+      rawHistory,
+      `Unexpected stale continuation history: ${fragment}`,
+    ).not.toContain(fragment);
   }
 }
 
@@ -273,16 +274,19 @@ function assertVibeContinuationResult(
     `Expected one vibe ${tool} tool result for ${callId}`,
   );
   // The backend interrupts the session right after a SwitchMode/Handoff
-  // succeeds ("the agent must yield"), so vibe records the tool outcome as
-  // its user-cancellation marker — the equivalent of claude's repaired
-  // rejection record. A result delivered before the cancel would carry the
-  // success text instead; accept either.
+  // succeeds ("the agent must yield"), so vibe persists the tool outcome
+  // as a `<user_cancellation>` marker — the CyDo repair rewrites that
+  // record to the intended success text (like the other drivers), so the
+  // resumed context always reports the successful switch.
   const resultJson = JSON.stringify(result);
   expect(
-    resultJson.includes(successPrefix) ||
-      resultJson.includes("interrupted by user"),
-    `Vibe ${tool} result should report the switch or the yield cancellation`,
+    resultJson.includes(successPrefix),
+    `Vibe ${tool} result should report the repaired success text`,
   ).toBe(true);
+  expect(
+    resultJson.includes("<user_cancellation>"),
+    `Vibe ${tool} result should not retain the stale user-cancellation marker`,
+  ).toBe(false);
 }
 
 test("keep_context continuation injects prompt template", async ({
@@ -318,7 +322,9 @@ test("keep_context continuation injects prompt template", async ({
     const rejectionNeedle =
       agentType === "claude"
         ? "The user doesn't want to proceed"
-        : "aborted by user after";
+        : agentType === "vibe"
+          ? "<user_cancellation>"
+          : "aborted by user after";
     const encodedNeedle = Buffer.from(rejectionNeedle).toString("base64");
     await sendMessage(page, `check context contains ${encodedNeedle}`);
     await expect(assistantText(page, "context-check-failed")).toBeVisible({

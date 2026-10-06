@@ -180,25 +180,37 @@ string repairInterruptedToolCallFile(string jsonlPath,
 		string resultText) repairFn,
 	string toolName, string resultText)
 {
-	import std.array : array, join;
-	import std.file : exists, readText, write;
+	import std.array : array, join, split;
+	import std.file : exists, readText, rename, write;
 	import std.logger : infof, warningf;
-	import std.string : lineSplitter;
 
 	try
 	{
 		if (jsonlPath.length == 0 || !exists(jsonlPath))
 			return null;
 
-		auto repaired = repairFn(readText(jsonlPath).lineSplitter.array,
-			toolName, resultText);
+		// Split on '\n' only: JSON string content may legally contain \r,
+		// U+0085, U+2028 and U+2029 raw, and a lineSplitter-based split
+		// would tear such messages into invalid JSON lines.
+		auto content = readText(jsonlPath);
+		auto lines = content.split('\n');
+		// A trailing newline yields one final empty element; drop it so
+		// the re-join below reproduces the original exactly.
+		if (lines.length > 0 && lines[$-1].length == 0)
+			lines = lines[0 .. $-1];
+
+		auto repaired = repairFn(lines.array, toolName, resultText);
 		if (repaired is null)
 		{
 			infof("Interrupted tool-call repair did not match %s", jsonlPath);
 			return null;
 		}
 
-		write(jsonlPath, repaired.lines.join("\n") ~ "\n");
+		// Write via a temp file + rename so a crash or full disk mid-write
+		// cannot truncate the session file.
+		auto tmpPath = jsonlPath ~ ".cydo-repair.tmp";
+		write(tmpPath, repaired.lines.join("\n") ~ "\n");
+		rename(tmpPath, jsonlPath);
 		return repaired.removedInterruptionUuid.length > 0
 			? repaired.removedInterruptionUuid
 			: null;
@@ -214,6 +226,7 @@ string repairInterruptedToolCallFile(string jsonlPath,
 unittest
 {
 	import core.sys.posix.sys.stat : chmod;
+	import std.conv : to;
 	import std.file : mkdirRecurse, readText, rmdirRecurse, write;
 	import std.path : buildPath;
 	import std.string : toStringz;
@@ -247,12 +260,33 @@ unittest
 		"mcp__cydo__SwitchMode", "RESULT") == "u2");
 	assert(readText(jsonlPath) == "repaired\n");
 
-	auto readOnlyPath = buildPath(dir, "read-only.jsonl");
+	// A message containing raw U+2028 (legal inside JSON strings) must
+	// survive the rewrite as one line — splitting on more than '\n' would
+	// tear it into two invalid JSON lines.
+	InterruptedToolCallRepair delegate(string[], string, string) rewritePreserve =
+		(string[] lines, string toolName, string resultText) {
+			assert(lines.length == 2, to!string(lines.length));
+			return new InterruptedToolCallRepair(lines);
+		};
+	auto unicodePath = buildPath(dir, "unicode.jsonl");
+	write(unicodePath, "{\"role\": \"user\", \"content\": \"line\u2028sep\"}\n"
+		~ "{\"role\": \"assistant\", \"content\": \"ok\"}\n");
+	assert(repairInterruptedToolCallFile(unicodePath, rewritePreserve,
+		"mcp__cydo__SwitchMode", "RESULT") is null);
+	assert(readText(unicodePath) == "{\"role\": \"user\", \"content\": \"line\u2028sep\"}\n"
+		~ "{\"role\": \"assistant\", \"content\": \"ok\"}\n");
+
+	// An unwritable parent directory makes the whole repair fail: the
+	// temp file for the atomic rename cannot be created.
+	auto roDir = buildPath(dir, "read-only-dir");
+	mkdirRecurse(roDir);
+	auto readOnlyPath = buildPath(roDir, "read-only.jsonl");
 	write(readOnlyPath, "before\n");
-	assert(chmod(readOnlyPath.toStringz, 256) == 0); // 0400
-	scope(exit) chmod(readOnlyPath.toStringz, 384); // 0600
+	assert(chmod(roDir.toStringz, 320) == 0); // 0500
+	scope(exit) chmod(roDir.toStringz, 448); // 0700
 	assert(repairInterruptedToolCallFile(readOnlyPath, rewriteMarker,
 		"mcp__cydo__SwitchMode", "RESULT") is null);
+	assert(readText(readOnlyPath) == "before\n");
 }
 
 /// Replace the JSONL line at 1-based lineNum with zero, one, or many lines.

@@ -98,7 +98,12 @@ test("End button shows ending state then session exits", { tag: "@no-codex" }, a
   await expect(page.locator(".banner-processing")).not.toBeVisible();
 });
 
-test("background command output re-enters processing state", { tag: "@no-copilot" }, async ({
+// Claude backgrounds a Bash command when its timeout fires, and the
+// backgrounded command's late output re-enters processing. Vibe's bash
+// tool has no timeout-backgrounding mechanism (pinned 2.25.8) and the
+// mock's chat dialect does not implement the timed_shell intent, so the
+// scenario cannot exercise vibe.
+test("background command output re-enters processing state", { tag: ["@no-copilot", "@no-vibe"] }, async ({
   page,
   agentType,
 }) => {

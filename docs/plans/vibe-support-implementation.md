@@ -278,7 +278,7 @@ Model on `AppServerProcess` (codex) + `SdkProcess` (copilot):
 ```d
 server.onReady(() {
     server.sendRequest("initialize", toJson(InitializeParams(1u,
-        ClientCapabilities(fsRead: true, fsWrite: true, terminal: false),
+        ClientCapabilities(fsRead: false, fsWrite: false, terminal: false),
         ClientInfo("cydo", "0.1.0"))))
     .then((JsonRpcResponse resp) {
         if (resp.isError) { failStartup(...); return; }
@@ -289,6 +289,11 @@ server.onReady(() {
     });
 });
 ```
+
+Client fs capabilities are advertised as `false`: CyDo implements no
+`fs/read_text_file` / `fs/write_text_file` handlers, and advertising them
+would make an agent that trusts the handshake send requests that fail
+with method-not-found.
 
 `session/new` params per S2 (wire-confirmed `{cwd, mcpServers}`; also
 accepts `additionalDirectories` — vibe supports it per its Agent interface):

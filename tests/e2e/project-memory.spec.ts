@@ -31,8 +31,7 @@ async function expectSubtaskResult(page: Page, text: string, timeout: number) {
   ).toBeVisible({ timeout });
 }
 
-test("project memory is injected into first user message",
-    async ({
+test("project memory is injected into first user message", async ({
   page,
   agentType,
 }) => {
@@ -54,7 +53,7 @@ test("project memory is injected into first user message",
   }
 });
 
-test("project memory marker appears in user message text (not only system prompt)", { tag: ["@no-copilot"] }, async ({
+test("project memory marker appears in user message text (not only system prompt)", { tag: "@no-copilot" }, async ({
   page,
   agentType,
 }) => {
@@ -79,8 +78,7 @@ test("project memory marker appears in user message text (not only system prompt
   }
 });
 
-test("MEMORY.md absent: framing injected with placeholder body",
-    async ({
+test("MEMORY.md absent: framing injected with placeholder body", async ({
   page,
   agentType,
 }) => {
@@ -109,8 +107,7 @@ test("MEMORY.md absent: framing injected with placeholder body",
   ).toBeVisible({ timeout: responseTimeout(agentType) });
 });
 
-test("task type with memory: false does not receive memory block",
-    async ({
+test("task type with memory: false does not receive memory block", async ({
   page,
   agentType,
 }) => {
@@ -131,8 +128,7 @@ test("task type with memory: false does not receive memory block",
   }
 });
 
-test("read-only task can write to memory carve-out",
-    async ({
+test("read-only task can write to memory carve-out", async ({
   page,
   agentType,
 }) => {
@@ -158,8 +154,7 @@ test("read-only task can write to memory carve-out",
   }
 });
 
-test("worktree-bound task writes via absolute path land in canonical store",
-    async ({
+test("worktree-bound task writes via absolute path land in canonical store", async ({
   page,
   agentType,
 }) => {
@@ -187,8 +182,7 @@ test("worktree-bound task writes via absolute path land in canonical store",
   }
 });
 
-test("memory written by one task is visible to the next task",
-    async ({
+test("memory written by one task is visible to the next task", async ({
   page,
   agentType,
 }) => {

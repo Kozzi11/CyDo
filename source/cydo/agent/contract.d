@@ -161,8 +161,12 @@ interface Agent
 	/// from {timestamp, type, payload} to agnostic events.
 	/// lineNum is 1-based; agents using line-number fork IDs can inject
 	/// the fork ID into translated output.
+	/// historyPath is the persisted file the line came from (null when
+	/// unknown); drivers that resolve file references inside lines (vibe:
+	/// image attachments) must restrict them relative to it.
 	/// Returns zero or more translated event pairs (empty = skip line).
-	TranslatedEvent[] translateHistoryLine(string line, int lineNum);
+	TranslatedEvent[] translateHistoryLine(string line, int lineNum,
+		string historyPath = null);
 
 	/// Path to the last-created MCP config temp file, or null if none.
 	/// Used for cleanup tracking (the file should be deleted when the
