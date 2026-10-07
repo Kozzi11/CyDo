@@ -10,3 +10,6 @@ result-*
 
 # Playwright test artifacts
 tests/test-results/
+
+# DUB artifacts
+.dub/
