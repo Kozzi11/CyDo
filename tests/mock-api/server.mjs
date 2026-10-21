@@ -1408,10 +1408,15 @@ function handleMessages(req, res) {
 //
 // Vibe speaks vanilla OpenAI chat: `{model, stream, messages, tools}` where
 // messages are `{role, content}` with `tool_calls` on assistant turns and
-// `{role: "tool", tool_call_id, name, content}` for results. Tool names are
-// the vibe-side names (`bash`, `cydo_Task`, ...) — MCP tools arrive as
-// `{server}_{tool}` per vibe's naming contract, so CyDo's MCP tools are
-// `cydo_<Tool>` on this wire (the driver decomposes the prefix).
+// `{role: "tool", tool_call_id, name, content}` for results.
+//
+// Vibe 3.x's Unified Harness exposes MCP tools only through programmatic
+// tool calling: the model invokes them from a `run_typescript` program via
+// `tools.<group>.<tool>` (group `mcp_<server>`), never as top-level tool
+// calls — a top-level `cydo_<Tool>` call is rejected with "unsupported
+// top-level tool" (verified against vibe-acp 3.0.1). CyDo's MCP tools
+// therefore ride as run_typescript programs; vibe's built-in tools (`bash`,
+// ...) stay direct top-level calls.
 function chatToolCall(name, input) {
   return {
     index: 0,
@@ -1419,6 +1424,23 @@ function chatToolCall(name, input) {
     type: "function",
     function: { name, arguments: JSON.stringify(input) },
   };
+}
+
+// Emit a chat-dialect tool call: CyDo MCP tools (`mcp__cydo__<Tool>`) are
+// wrapped in a run_typescript program; anything else is a direct call.
+function chatToolCallFor(emit, name, input) {
+  if (name.startsWith("mcp__cydo__")) {
+    const tool = name.slice("mcp__cydo__".length);
+    const code =
+      `const __cydoResult = await tools.mcp_cydo.${tool}(${JSON.stringify(input)});\n` +
+      `return __cydoResult;`;
+    emit(
+      { role: "assistant", tool_calls: [chatToolCall("run_typescript", { code })] },
+      "tool_calls",
+    );
+  } else {
+    emit({ role: "assistant", tool_calls: [chatToolCall(name, input)] }, "tool_calls");
+  }
 }
 
 /// Vibe's generic chat client cannot accumulate parallel tool calls with
@@ -1455,10 +1477,10 @@ function nextPendingToolCall(messages) {
   const next = intent.tool_calls[results];
   if (!next)
     return null;
+  // Keep the original `mcp__cydo__<Tool>` name: the chat dialect wraps CyDo
+  // MCP tools in run_typescript programs (see chatToolCallFor).
   return {
-    name: next.name.startsWith("mcp__cydo__")
-      ? `cydo_${next.name.slice("mcp__cydo__".length)}`
-      : next.name,
+    name: next.name,
     input: next.input,
   };
 }
@@ -1548,7 +1570,7 @@ function handleChatCompletions(req, res) {
       emit({}, "stop");
     };
     const emitToolCall = (name, input) => {
-      emit({ role: "assistant", tool_calls: [chatToolCall(name, input)] }, "tool_calls");
+      chatToolCallFor(emit, name, input);
     };
     const finishStream = () => {
       res.write(
@@ -1586,7 +1608,8 @@ function handleChatCompletions(req, res) {
     }
 
     // Map intents to chat-completions responses. Vibe's bash tool takes
-    // {command}; MCP tool calls use the vibe-side `cydo_<Tool>` name.
+    // {command}; CyDo MCP tool calls (`mcp__cydo__<Tool>`) are wrapped in
+    // run_typescript programs (see chatToolCallFor).
     if (intent.type === "check_context") {
       const needle = Buffer.from(intent.needle, "base64").toString("utf-8");
       const haystack = JSON.stringify(parsed);
@@ -1608,22 +1631,14 @@ function handleChatCompletions(req, res) {
       emitToolCall("bash", { command: intent.command });
       finishStream();
     } else if (intent.type === "tool_call") {
-      const name = intent.name.startsWith("mcp__cydo__")
-        ? `cydo_${intent.name.slice("mcp__cydo__".length)}`
-        : intent.name;
-      emitToolCall(name, intent.input);
+      emitToolCall(intent.name, intent.input);
       finishStream();
     } else if (intent.type === "multi_tool_call") {
       // Vibe's chat client rejects parallel tool calls with different
       // names in one message — emit only the first; each tool result
       // advances to the next call (see nextPendingToolCall).
       const first = intent.tool_calls[0];
-      emitToolCall(
-        first.name.startsWith("mcp__cydo__")
-          ? `cydo_${first.name.slice("mcp__cydo__".length)}`
-          : first.name,
-        first.input,
-      );
+      emitToolCall(first.name, first.input);
       finishStream();
     } else if (intent.type === "stall") {
       // Emit a role delta so the stream is well-formed, then never finish.

@@ -13,13 +13,13 @@ import ae.net.jsonrpc.binding : JsonRpcDispatcher, jsonRpcDispatcher,
 import ae.net.jsonrpc.codec : JsonRpcCodec;
 import ae.utils.json : JSONFragment, JSONName, JSONOptional, JSONPartial,
 	jsonParse, toJson;
-import ae.utils.jsonrpc : JsonRpcRequest, JsonRpcResponse;
+import ae.utils.jsonrpc : JsonRpcError, JsonRpcErrorCode, JsonRpcRequest,
+	JsonRpcResponse;
 import ae.utils.promise : Promise, resolve;
 import ae.utils.serialization.store : SerializedObject;
 
 version (unittest) import ae.net.asockets : ConnectionState, DisconnectType;
 version (unittest) import ae.sys.data : Data;
-version (unittest) import ae.utils.jsonrpc : JsonRpcError, JsonRpcErrorCode;
 
 import cydo.agent.contract : Agent, DiscoveredSession, InterruptedToolCallRepair,
 	OneShotHandle, PersistedHistoryBoundary, PersistedHistoryBoundaryKind,
@@ -31,8 +31,9 @@ import cydo.protocol : ContentBlock, extractContentText, ItemCompletedEvent,
 	ProcessExitEvent, ProcessStderrEvent, SessionCompactedEvent, SessionInitEvent,
 	TranslatedEvent, TurnResultEvent, TurnStopEvent, UsageInfo;
 import cydo.runtime.config : AgentDriver, ModelSpec, ModelSpecFields;
-import cydo.runtime.launch.sandbox : cydoBinaryDir, cydoBinaryPath,
-	effectiveEnvValue, executableMountPaths, resolveExecutablePath;
+import cydo.runtime.launch.sandbox : cleanup, cydoBinaryDir, cydoBinaryPath,
+	effectiveEnvValue, executableMountPaths, resolveExecutablePath,
+	withProcessLaunchEnv;
 import cydo.runtime.launch.sandbox_paths : PathAccess, SandboxPathOrigin,
 	SandboxPathOriginKind, SandboxPaths;
 import cydo.runtime.launch.types : NativeHistoryProfile, NativeHistoryRule,
@@ -41,7 +42,7 @@ import cydo.runtime.launch.types : NativeHistoryProfile, NativeHistoryRule,
 private alias SO = SerializedObject!(immutable char);
 
 // ---------------------------------------------------------------------------
-// ACP wire structs — protocol v1, verified against vibe-acp 2.25.4–2.25.8
+// ACP wire structs — protocol v1, verified against vibe-acp 2.25.4–2.26.1
 // (see docs/research/vibe-acp-wire.md and docs/research/acp/SPEC_v1.md).
 // ---------------------------------------------------------------------------
 
@@ -149,13 +150,20 @@ private struct CancelParams
 
 // session/set_config_option (stable, ACP v1): the select-option variant
 // (mode, model, thinking) carries the value as a plain JSON string —
-// verified against vibe-acp 2.25.8, which rejects a {value: "<id>"}
+// verified against vibe-acp 2.25.8–2.26.1, which reject a {value: "<id>"}
 // object with -32602 "Input should be a valid string".
 private struct SetConfigOptionParams
 {
 	string sessionId;
 	string configId;
 	string value;
+}
+
+// session/set_mode (stable, ACP v1): {sessionId, modeId}.
+private struct SetModeParams
+{
+	string sessionId;
+	string modeId;
 }
 
 // Persisted LLM-message format (S5): one message per line in
@@ -625,12 +633,6 @@ class VibeAgent : Agent
 			paths.requireReadVisible(path,
 				SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "vibe",
 					"Vibe executable"));
-		// One-shot completion runs the separate `vibe` CLI binary; when it is
-		// resolvable it must be visible in the sandbox too.
-		foreach (path; executableMountPaths(resolveExecutablePath(oneShotExecutableName(env), env)))
-			paths.requireReadVisible(path,
-				SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "vibe",
-					"Vibe one-shot CLI"));
 		paths.requireReadVisible(cydoBinaryDir(),
 			SandboxPathOrigin(SandboxPathOriginKind.agentRequirement, "vibe",
 				"CyDo binary"));
@@ -650,6 +652,13 @@ class VibeAgent : Agent
 		passthrough("HTTPS_PROXY");
 		passthrough("NO_PROXY");
 		passthrough("PATH");
+
+		// vibe 3.x generates a background session title per ACP session
+		// (one extra model call CyDo does not need — CyDo titles tasks
+		// itself). Suppress it for CyDo-spawned sessions only; the env
+		// override is per child process, so the user's own vibe sessions
+		// keep their titles (verified against vibe-acp 3.0.1).
+		env["VIBE_SESSION_LOGGING__GENERATE_TITLES"] = "false";
 	}
 
 	@property string gitName() { return "Mistral Vibe"; }
@@ -668,13 +677,6 @@ class VibeAgent : Agent
 		return effectiveEnvValue(env, "CYDO_VIBE_BIN", "vibe-acp");
 	}
 
-	/// The one-shot path runs the `vibe` CLI rather than `vibe-acp`: both read
-	/// the same config, but only the CLI exposes the programmatic --prompt mode.
-	string oneShotExecutableName(string[string] env)
-	{
-		return effectiveEnvValue(env, "CYDO_VIBE_CLI_BIN", "vibe");
-	}
-
 	AgentSession createSession(int tid, string resumeSessionId, ProcessLaunch launch,
 		SessionConfig config = SessionConfig.init)
 	{
@@ -685,7 +687,22 @@ class VibeAgent : Agent
 
 		bootstrapVibeProfile(launch, config);
 
-		// S2-verified: vibe-acp is stdio-only; no launch flags.
+		// S2-verified: vibe-acp is stdio-only; no launch flags. vibe 3.x
+		// removed --legacy-harness along with the legacy runtime: sessions
+		// always use the Unified Harness, which stores transcripts in the
+		// chunked logs/session/unified/<uuid>/ store. This driver's history
+		// subsystem (live watch, fork, undo) reads and writes the legacy
+		// logs/session/session_<ts>_<id8>/messages.jsonl layout, so the
+		// driver keeps its own transcript per session (see VibeSession's
+		// transcript writer) instead of relying on vibe's store.
+		//
+		// On resume, vibe would restore from its own unified store, which
+		// predates any CyDo-side transcript edits (mode-switch reframe,
+		// undo). Discard it so session/load imports the driver's transcript
+		// and the resumed context matches what the UI shows.
+		if (resumeSessionId.length > 0)
+			discardUnifiedStoreForResume(resumeSessionId,
+				launch.nativeHistoryProfile);
 		auto vibeBin = launch.executablePath.length > 0
 			? launch.executablePath
 			: executableName(launch.sandbox.env);
@@ -694,7 +711,8 @@ class VibeAgent : Agent
 			? launch.cmdPrefix ~ vibeArgs : vibeArgs;
 
 		auto server = new VibeAcpProcess(args, null, null, "vibe");
-		return attachSession(server, tid, resumeSessionId, model, workDir, config);
+		return attachSession(server, tid, resumeSessionId, model, workDir, config,
+			launch.nativeHistoryProfile);
 	}
 
 	/// Write the profile bootstrap files when a native-history profile root
@@ -813,7 +831,16 @@ class VibeAgent : Agent
 	{
 		switch (modelClass)
 		{
-			case "small":  return "devstral-small";
+			// vibe 2.26.x ships exactly one built-in hosted model,
+			// `mistral-medium-3.5`; the old `devstral-small` default was a
+			// built-in that vibe removed (v2.26.1 drops it and warns on stale
+			// pins). vibe-acp rejects an unknown alias in
+			// session/set_config_option ("Unsupported config option
+			// model=..."), which fails session startup, and the one-shot CLI
+			// silently falls back to the default — so every class maps to the
+			// one alias that resolves. Users wanting a distinct small model
+			// configure `model_aliases` (or a custom [[models]] entry).
+			case "small":  return "mistral-medium-3.5";
 			case "medium": return "mistral-medium-3.5";
 			case "large":  return "mistral-medium-3.5";
 			default:       return modelClass; // pass through unknown aliases
@@ -872,6 +899,40 @@ class VibeAgent : Agent
 		return byPath[names[$ - 1]];
 	}
 
+	/// Discard vibe 3.x's chunked unified store for a session about to be
+	/// resumed via session/load. vibe restores from
+	/// $VIBE_HOME/logs/session/unified/<sessionId>/ when present, ignoring
+	/// the driver-written legacy transcript that CyDo may have edited since
+	/// (keep_context mode-switch reframe, undo truncation, fork). Deleting
+	/// the store makes session/load import the legacy transcript instead, so
+	/// the resumed LLM context matches the transcript. No-op when the
+	/// session has no driver-written transcript — vibe's store is then the
+	/// only copy and must be kept.
+	void discardUnifiedStoreForResume(string sessionId,
+		const ref NativeHistoryProfile profile)
+	{
+		import std.file : exists, rmdirRecurse;
+		import std.logger : tracef;
+
+		if (sessionId.length == 0 || profile.root.length == 0)
+			return;
+		if (historyPath(sessionId, profile).length == 0)
+			return;
+		auto storeDir = buildPath(profile.root, "logs", "session", "unified",
+			sessionId);
+		try
+		{
+			if (storeDir.exists)
+			{
+				rmdirRecurse(storeDir);
+				tracef("discardUnifiedStoreForResume: removed %s", storeDir);
+			}
+		}
+		catch (Exception e)
+			tracef("discardUnifiedStoreForResume: failed to remove %s: %s",
+				storeDir, e.msg);
+	}
+
 	void registerHistoryPath(string sessionId, string path,
 		const ref NativeHistoryProfile profile)
 	{
@@ -913,7 +974,7 @@ class VibeAgent : Agent
 
 		// vibe's SessionMetadata (pydantic) requires session_id, start_time,
 		// end_time, git_commit, git_branch, environment, username; the loader
-		// additionally keys total_messages. Verified against 2.25.8: a
+		// additionally keys total_messages. Verified against 2.26.1: a
 		// synthesized dir with this shape resumes via session/load, and a
 		// wrong total_messages is tolerated (metadata only, not validated
 		// against the transcript).
@@ -1136,20 +1197,20 @@ class VibeAgent : Agent
 					{
 						// Same naming contract as the live translation:
 						// cydo_<tool> MCP names decompose into the canonical
-						// name plus the cydo server.
+						// name plus the cydo server (the transcript writer
+						// normalizes vibe 3.x's mcp_cydo.<tool> to cydo_<tool>).
 						auto name = call.function_.name.length > 0
 							? call.function_.name : "unknown";
 						ItemStartedEvent toolStartEv;
 						toolStartEv.item_id = "vb-tool-" ~ call.id;
 						toolStartEv.item_type = "tool_use";
-						if (name.startsWith("cydo_"))
+						auto parts = decomposeVibeToolName(name);
+						toolStartEv.name = parts.displayName;
+						if (parts.toolServer.length > 0)
 						{
-							toolStartEv.name = name[5 .. $];
-							toolStartEv.tool_server = "cydo";
-							toolStartEv.tool_source = "mcp";
+							toolStartEv.tool_server = parts.toolServer;
+							toolStartEv.tool_source = parts.toolSource;
 						}
-						else
-							toolStartEv.name = name;
 						toolStartEv.input = JSONFragment(
 							call.function_.arguments.length > 0
 								? call.function_.arguments : `{}`);
@@ -1277,7 +1338,7 @@ class VibeAgent : Agent
 		// interrupted call as an assistant tool_calls line plus a
 		// role:"tool" record whose content carries the
 		// `<user_cancellation>` marker (verified against vibe-acp
-		// 2.25.8). Rewrite that record to the intended result so the
+		// 2.26.1). Rewrite that record to the intended result so the
 		// resumed context reports the successful switch instead of a
 		// user cancellation — mirroring the claude driver's rejection
 		// repair. Returns null when the expected shape is not present
@@ -1595,89 +1656,95 @@ class VibeAgent : Agent
 	OneShotHandle completeOneShot(string prompt, string modelClass,
 		ProcessLaunch launch)
 	{
-		import std.process : environment;
-		import std.string : strip;
-
 		auto promise = new Promise!string;
-		// One-shot runs the `vibe` CLI's programmatic mode; vibe-acp has no
-		// --prompt mode, so the session's executablePath (vibe-acp) is not
-		// consulted here.
-		auto vibeBin = oneShotExecutableName(launch.sandbox.env);
-
 		auto spec = resolveModelSpec(modelClass);
-		string[string] env = buildVibeOneShotEnv(spec.model);
-		auto args = buildVibeOneShotArgs(vibeBin, prompt, launch);
 
-		// Unsandboxed: pass the minimal env above. Sandboxed: the child
-		// inherits the parent environment (cmdPrefix carries the sandbox
-		// settings), so the override needs a full copy of it to survive
-		// there.
+		// One-shots run through vibe-acp itself (see VibeOneShotAcp): vibe
+		// 3.x removed the legacy runtime, and the one-shot `vibe` CLI's
+		// app-server spawn path shells out to `uv`, which is absent in the
+		// sandbox. The session's executablePath (vibe-acp) is the binary.
+		//
+		// The no-tools guard rides two layers (see VibeOneShotAcp): the
+		// session is switched to "ask" mode with every permission request
+		// denied, and the mutating built-in tools are denied outright via a
+		// per-child VIBE_TOOLS override (vibe 3.x has no config-level way to
+		// disable the built-in harness tools, and a tool configured
+		// `permission = "always"` would otherwise bypass the ask-mode gate).
+		// The override is per child process, so the main session's tool
+		// permissions are untouched.
+		ProcessLaunch oneShotLaunch;
+		bool hasOneShotLaunch;
 		string[string] procEnv;
-		if (launch.cmdPrefix is null)
-			procEnv = env;
-		else if (spec.model.length > 0)
-		{
-			procEnv = environment.toAA();
-			procEnv["VIBE_ACTIVE_MODEL"] = spec.model;
-		}
-
-		AgentProcess proc;
 		try
-			proc = new AgentProcess(args, procEnv, noStdin: true,
-				mode: FramingMode.raw, logName: "vibe-oneshot");
+		{
+			if (launch.cmdPrefix !is null)
+			{
+				oneShotLaunch = withProcessLaunchEnv(launch, "VIBE_TOOLS",
+					vibeOneShotNoToolsJson);
+				hasOneShotLaunch = true;
+			}
+			else
+			{
+				procEnv = buildVibeOneShotEnv();
+				procEnv["VIBE_TOOLS"] = vibeOneShotNoToolsJson;
+			}
+		}
 		catch (Exception e)
 		{
-			promise.reject(new Exception("failed to spawn vibe: " ~ e.msg));
+			promise.reject(new Exception(
+				"failed to prepare vibe one-shot launch: " ~ e.msg));
 			return OneShotHandle(promise, null);
 		}
 
-		string responseText;
-		string stderrText;
+		auto effectiveLaunch = hasOneShotLaunch ? oneShotLaunch : launch;
+		auto acpBin = effectiveLaunch.executablePath.length > 0
+			? effectiveLaunch.executablePath
+			: executableName(effectiveLaunch.sandbox.env);
+		auto args = buildVibeOneShotArgs(acpBin, effectiveLaunch);
 
-		proc.onStdoutLine = (string chunk) {
-			responseText ~= chunk;
-		};
+		auto workDir = effectiveLaunch.workDir.length > 0
+			? effectiveLaunch.workDir : null;
 
-		proc.onStderrLine = (string line) {
-			stderrText ~= line ~ "\n";
-		};
+		VibeOneShotAcp oneShot;
+		try
+			oneShot = new VibeOneShotAcp(args, procEnv, workDir, spec.model,
+				prompt, promise);
+		catch (Exception e)
+		{
+			if (hasOneShotLaunch)
+				cleanup(oneShotLaunch.sandbox);
+			promise.reject(new Exception("failed to spawn vibe-acp: " ~ e.msg));
+			return OneShotHandle(promise, null);
+		}
+		if (hasOneShotLaunch)
+			oneShot.onSettled = { cleanup(oneShotLaunch.sandbox); };
 
-		proc.onExit = (int status) {
-			if (status != 0)
-			{
-				auto msg = "vibe exited with status " ~ status.to!string;
-				auto details = stderrText.strip();
-				if (details.length > 0)
-					msg ~= ": " ~ details;
-				promise.reject(new Exception(msg));
-			}
-			else
-				promise.fulfill(responseText.strip());
-		};
-
-		void cancel() { proc.killAfterTimeout(0.seconds); }
+		void cancel() { oneShot.cancel(); }
 
 		return OneShotHandle(promise, &cancel);
 	}
 }
 
-private static string[] buildVibeOneShotArgs(string vibeBin, string prompt,
-	ProcessLaunch launch)
+/// Per-child `VIBE_TOOLS` override for one-shots: deny the mutating
+/// built-in tools outright (`permission = "never"`). vibe 3.x's Unified
+/// Harness has no config-level way to disable its built-in tools, and a
+/// tool the user configured `permission = "always"` would otherwise bypass
+/// the one-shot's ask-mode gate (verified against vibe-acp 3.0.1: the
+/// override denies the call with "Tool execution denied by approval
+/// policy" and the turn completes). The env layer deep-merges this over
+/// the profile's `[tools.*]` tables for the one-shot child only.
+private static immutable string vibeOneShotNoToolsJson =
+	`{"bash":{"permission":"never"},` ~
+	`"read_file":{"permission":"never"},` ~
+	`"write_file":{"permission":"never"},` ~
+	`"edit":{"permission":"never"},` ~
+	`"skill":{"permission":"never"}}`;
+
+/// Spawn arguments for the one-shot vibe-acp child: the binary, behind the
+/// sandbox prefix when one is configured.
+private static string[] buildVibeOneShotArgs(string acpBin, ProcessLaunch launch)
 {
-	string[] args = [
-		vibeBin,
-		"--prompt", prompt,
-		"--output", "text",
-		"--max-turns", "1",
-		// Titles and suggestions are generated from conversation content,
-		// which may include untrusted file or web text. Mirror the claude
-		// driver's `--tools ""` no-tools one-shot: --enabled-tools with a
-		// name that matches no tool disables every tool in programmatic
-		// mode (verified against vibe 2.25.8), so no tool call can run on
-		// the host. --yolo (auto-approve everything) is deliberately not
-		// used.
-		"--enabled-tools", "__cydo_no_tools__",
-	];
+	string[] args = [acpBin];
 	if (launch.cmdPrefix !is null)
 		args = launch.cmdPrefix ~ args;
 	return args;
@@ -1688,9 +1755,9 @@ private static string[] buildVibeOneShotArgs(string vibeBin, string prompt,
 /// root, proxies) pass through when set so users who configure the
 /// interactive path via env instead of ~/.vibe/.env keep working one-shot
 /// completions — the same passthrough list as configureSandbox. The
-/// sandboxed child inherits the parent environment wholesale, so it needs
-/// only the model override forced.
-private static string[string] buildVibeOneShotEnv(string model)
+/// sandboxed child inherits the parent environment wholesale via the
+/// sandbox prefix, so it needs no override here.
+private static string[string] buildVibeOneShotEnv()
 {
 	import std.process : environment;
 
@@ -1704,12 +1771,283 @@ private static string[string] buildVibeOneShotEnv(string model)
 		if (value.length > 0)
 			env[key] = value;
 	}
-	// The CLI has no --model flag; VIBE_ACTIVE_MODEL overrides any config
-	// field (verified against vibe 2.25.4–2.25.8). An empty alias leaves it
-	// unset so vibe uses its own configured default.
-	if (model.length > 0)
-		env["VIBE_ACTIVE_MODEL"] = model;
+	// Suppress vibe's background session-title generation for one-shots
+	// (see configureSandbox).
+	env["VIBE_SESSION_LOGGING__GENERATE_TITLES"] = "false";
 	return env;
+}
+
+// ---------------------------------------------------------------------------
+// VibeOneShotAcp — a minimal ACP client for one-shot completions (titles,
+// suggestions). vibe 3.x removed the legacy runtime, and the one-shot
+// `vibe` CLI's app-server spawn path shells out to `uv` (absent in the
+// sandbox), so one-shots run through vibe-acp itself: a throwaway session
+// with no MCP servers, switched to "ask" mode with every permission
+// request denied — the ACP-level equivalent of the 2.x
+// `--enabled-tools __cydo_no_tools__` guard, so no tool can execute on
+// untrusted prompt content (titles and suggestions are generated from
+// conversation history, which may include untrusted file or web text).
+// ---------------------------------------------------------------------------
+
+private class VibeOneShotAcp
+{
+	private AgentProcess process;
+	private JsonRpcCodec codec;
+	private Promise!string promise;
+	private string workDir;
+	private string responseText;
+	private string stderrText;
+	private bool settled;
+
+	/// Called once when the one-shot settles (success, failure, or exit),
+	/// so the caller can release launch-clone resources.
+	void delegate() onSettled;
+
+	this(string[] args, string[string] env, string workDir, string model,
+		string prompt, Promise!string promise)
+	{
+		this.promise = promise;
+		this.workDir = workDir;
+		process = new AgentProcess(args, env, workDir, false,
+			FramingMode.ndjson, "vibe-oneshot");
+		codec = new JsonRpcCodec(process.connection);
+		codec.handleRequest = &handleAgentRequest;
+
+		process.onStderrLine = (string line) {
+			stderrText ~= line ~ "\n";
+		};
+		process.onExit = (int status) { handleExit(status); };
+
+		sendInitialize(model, prompt);
+	}
+
+	version (unittest) private this(IConnection connection, string model,
+		string prompt, Promise!string promise)
+	{
+		this.promise = promise;
+		codec = new JsonRpcCodec(connection);
+		codec.handleRequest = &handleAgentRequest;
+		sendInitialize(model, prompt);
+	}
+
+	void cancel()
+	{
+		// No-op once the one-shot has settled.
+		if (settled || process is null)
+			return;
+		process.killAfterTimeout(0.seconds);
+	}
+
+	private Promise!JsonRpcResponse sendRequest(string method, string params)
+	{
+		JsonRpcRequest req;
+		req.method = method;
+		req.params = jsonParse!SO(params);
+		return codec.sendRequest(req);
+	}
+
+	private void sendNotification(string method, string params)
+	{
+		JsonRpcRequest req;
+		req.method = method;
+		req.params = jsonParse!SO(params);
+		codec.sendNotification(req);
+	}
+
+	/// Agent → client messages: accumulate assistant text chunks; deny
+	/// every permission request (the no-tools guard — see the class
+	/// comment). Any other request (e.g. an elicitation for a user
+	/// question) gets a method-not-found error, which fails that tool
+	/// call without hanging the turn.
+	private Promise!JsonRpcResponse handleAgentRequest(JsonRpcRequest request)
+	{
+		if (request.method == "session/update")
+		{
+			try
+			{
+				auto params = request.params.deserializeTo!SessionUpdateParams();
+				auto update = params.update.deserializeTo!VibeSessionUpdate();
+				if (update.sessionUpdate == "agent_message_chunk")
+					responseText ~= chunkText(update.content);
+			}
+			catch (Exception) {}
+			return resolve(JsonRpcResponse.init);
+		}
+		if (request.method == "session/request_permission")
+		{
+			JsonRpcResponse resp;
+			resp.id = request.id;
+			resp.result = jsonParse!SO(toJson(PermissionOutcome.cancelled()));
+			return resolve(resp);
+		}
+		if (request.isNotification)
+			return resolve(JsonRpcResponse.init);
+		JsonRpcResponse resp;
+		resp.id = request.id;
+		resp.error = JsonRpcError.fromCode(JsonRpcErrorCode.methodNotFound,
+			"unsupported one-shot request: " ~ request.method);
+		return resolve(resp);
+	}
+
+	private void fail(Exception e)
+	{
+		if (settled)
+			return;
+		settled = true;
+		shutdown();
+		if (onSettled !is null)
+			onSettled();
+		promise.reject(e);
+	}
+
+	private void succeed()
+	{
+		if (settled)
+			return;
+		settled = true;
+		shutdown();
+		if (onSettled !is null)
+			onSettled();
+		import std.string : strip;
+		promise.fulfill(responseText.strip());
+	}
+
+	private void handleExit(int status)
+	{
+		if (settled)
+			return;
+		auto msg = "vibe-acp exited with status " ~ status.to!string;
+		import std.string : strip;
+		auto details = stderrText.strip();
+		if (details.length > 0)
+			msg ~= ": " ~ details;
+		fail(new Exception(msg));
+	}
+
+	private void shutdown()
+	{
+		if (process is null || process.dead)
+			return;
+		process.closeStdin();
+		process.terminate();
+		process.killAfterTimeout(3.seconds);
+	}
+
+	private void sendInitialize(string model, string prompt)
+	{
+		VibeInitializeParams params;
+		params.protocolVersion = 1;
+		params.clientCapabilities.fs.readTextFile = false;
+		params.clientCapabilities.fs.writeTextFile = false;
+		params.clientCapabilities.terminal = false;
+		VibeClientInfo clientInfo;
+		clientInfo.name = "cydo";
+		clientInfo.version_ = "0.1.0";
+		params.clientInfo = clientInfo;
+		sendRequest("initialize", toJson(params))
+			.then((JsonRpcResponse resp) {
+				if (resp.isError)
+				{
+					fail(new Exception("initialize error: "
+						~ resp.error.get.message));
+					return;
+				}
+				sendNewSession(model, prompt);
+			}, (Exception e) { fail(e); });
+	}
+
+	private void sendNewSession(string model, string prompt)
+	{
+		NewSessionParams params;
+		// The one-shot prompt needs no workspace; vibe requires a cwd, so
+		// use the launch work dir (the child process's own cwd).
+		params.cwd = workDir.length > 0 ? workDir : ".";
+		params.mcpServers = null;
+		sendRequest("session/new", toJson(params))
+			.then((JsonRpcResponse resp) {
+				if (resp.isError)
+				{
+					fail(new Exception("session/new error: "
+						~ resp.error.get.message));
+					return;
+				}
+				string sessionId;
+				try
+				{
+					auto nsr = resp.result.deserializeTo!NewSessionResponse();
+					sessionId = nsr.sessionId;
+				}
+				catch (Exception) {}
+				if (sessionId.length == 0)
+				{
+					fail(new Exception("session/new response has no session ID"));
+					return;
+				}
+				applyAskMode(sessionId, model, prompt);
+			}, (Exception e) { fail(e); });
+	}
+
+	/// Switch the throwaway session to "ask" mode so every tool execution
+	/// requires approval — which this client then denies (the no-tools
+	/// guard). Applied before the model is pinned and the prompt sent.
+	private void applyAskMode(string sessionId, string model, string prompt)
+	{
+		SetModeParams params;
+		params.sessionId = sessionId;
+		params.modeId = "ask";
+		sendRequest("session/set_mode", toJson(params))
+			.then((JsonRpcResponse resp) {
+				if (resp.isError)
+				{
+					fail(new Exception("session/set_mode error: "
+						~ resp.error.get.message));
+					return;
+				}
+				applyModel(sessionId, model, prompt);
+			}, (Exception e) { fail(e); });
+	}
+
+	private void applyModel(string sessionId, string model, string prompt)
+	{
+		if (model.length == 0)
+		{
+			sendPrompt(sessionId, prompt);
+			return;
+		}
+		SetConfigOptionParams params;
+		params.sessionId = sessionId;
+		params.configId = "model";
+		params.value = model;
+		sendRequest("session/set_config_option", toJson(params))
+			.then((JsonRpcResponse resp) {
+				if (resp.isError)
+				{
+					fail(new Exception("session/set_config_option error: "
+						~ resp.error.get.message));
+					return;
+				}
+				sendPrompt(sessionId, prompt);
+			}, (Exception e) { fail(e); });
+	}
+
+	private void sendPrompt(string sessionId, string prompt)
+	{
+		PromptParams params;
+		params.sessionId = sessionId;
+		VibePromptBlock block;
+		block.text = prompt;
+		params.prompt = [block];
+		sendRequest("session/prompt", toJson(params))
+			.then((JsonRpcResponse resp) {
+				if (resp.isError)
+				{
+					fail(new Exception("session/prompt error: "
+						~ resp.error.get.message));
+					return;
+				}
+				succeed();
+			}, (Exception e) { fail(e); });
+	}
 }
 
 /// Escape a value for a TOML basic ("…") string: backslash and double
@@ -1790,7 +2128,7 @@ private string buildLoadSessionParams(int tid, string sessionId, string workDir,
 /// Apply CyDo's per-session model and effort once the session exists, then
 /// hand control to the ready path. The model rides the `model` config
 /// option (S8: a select option on session/new, verified accepted by
-/// session/set_config_option against vibe-acp 2.25.8) so each task's
+/// session/set_config_option against vibe-acp 2.26.1) so each task's
 /// resolved model class is honoured per session instead of depending on
 /// the profile's global `active_model`. The launch `effort` parameter maps
 /// to vibe's `thinking` option (off/low/medium/high/max per S8). Empty
@@ -1871,9 +2209,11 @@ private VibeSessionMeta readVibeMetaFile(string path)
 // ---------------------------------------------------------------------------
 
 private VibeSession attachSession(VibeAcpProcess server, int tid,
-	string resumeSessionId, string model, string workDir, SessionConfig config)
+	string resumeSessionId, string model, string workDir, SessionConfig config,
+	NativeHistoryProfile transcriptProfile = NativeHistoryProfile.init)
 {
-	auto session = new VibeSession(server, tid, model, workDir, config.agentName);
+	auto session = new VibeSession(server, tid, model, workDir, config.agentName,
+		transcriptProfile);
 
 	// Route startup failures, stderr, and exit before the session ID is
 	// adopted (new sessions learn it from the session/new response).
@@ -2005,10 +2345,36 @@ class VibeSession : AgentSession, VibeSessionHandler
 		string name;  // canonical tool name
 		string input; // tool input JSON
 		bool inputEmitted; // rawInput already emitted as input_json_delta
+		string vibeName;    // vibe-side tool name (e.g. "cydo_SwitchMode")
+		string toolCallId;  // vibe toolCallId
 	}
 	private ToolItem[string] activeTools; // keyed by toolCallId
 
 	private string lastResultText; // last completed text content, for turn/result
+
+	// Transcript writer. vibe 3.x removed the legacy runtime, so sessions
+	// are stored in the chunked logs/session/unified/<uuid>/ store and no
+	// messages.jsonl is written. The driver keeps its own legacy-shaped
+	// messages.jsonl per session (written from the live ACP stream) so the
+	// history pipeline — live watch, fork, undo, export — works unchanged.
+	private NativeHistoryProfile transcriptProfile_;
+	private string transcriptPath_; // .../session_<ts>_<id8>/messages.jsonl
+	private string transcriptDir_;
+
+	// Accumulator for the assistant LLM message currently streaming:
+	// thinking + text + tool_calls group into one legacy assistant line
+	// (the persisted translator synthesizes turn/result only for a
+	// plain-content line, so the grouping must match the live turn shape).
+	private struct AssistantAccum
+	{
+		string baseUuid;    // shared uuid of the reasoning-/assistant- chunks
+		string messageId;   // assistant-<uuid> preferred, else reasoning-...
+		string thinking;
+		string text;
+		string[] toolCalls; // serialized tool-call JSON objects
+	}
+	private AssistantAccum assistantAccum_;
+	private bool assistantAccumActive_;
 
 	// Raw/timestamp plumbing for the update currently being translated.
 	private string currentRawJson_;
@@ -2072,13 +2438,15 @@ class VibeSession : AgentSession, VibeSessionHandler
 	private bool nativeSessionStartedNotified_;
 
 	this(VibeAcpProcess server, int tid, string model, string workDir,
-		string agentName = null)
+		string agentName = null,
+		NativeHistoryProfile transcriptProfile = NativeHistoryProfile.init)
 	{
 		this.server = server;
 		this.tid = tid;
 		this.model = model;
 		this.workDir = workDir;
 		this.agentName_ = agentName;
+		this.transcriptProfile_ = transcriptProfile;
 		this.alive_ = true;
 	}
 
@@ -2125,6 +2493,214 @@ class VibeSession : AgentSession, VibeSessionHandler
 
 		// Drain queued messages now that the session is ready.
 		drainPendingMessages();
+	}
+
+	// ----- Transcript writer (vibe 3.x unified store has no messages.jsonl) -----
+
+	/// Locate or create this session's legacy-shaped transcript dir and
+	/// return its messages.jsonl path. Reuses an existing legacy dir for
+	/// the session (driver-written during a previous live run, a 2.26.x
+	/// vibe dir, or a CyDo-synthesized fork) so appends continue it;
+	/// otherwise creates a new session_<ts>_<id8>/ dir with meta.json.
+	private string ensureTranscriptPath()
+	{
+		if (transcriptPath_.length > 0)
+			return transcriptPath_;
+		if (transcriptProfile_.root.length == 0 || sessionId_.length < 8)
+			return null;
+		import std.file : exists, mkdirRecurse, write;
+		import std.path : buildPath, dirName;
+
+		auto sessionsDir = buildPath(transcriptProfile_.root, "logs", "session");
+		// Reuse an existing legacy dir for this session id.
+		try
+		{
+			import std.file : dirEntries, SpanMode;
+			import std.path : baseName;
+			import std.array : split;
+			auto prefix = sessionId_[0 .. 8];
+			foreach (entry; dirEntries(sessionsDir, "session_*", SpanMode.shallow))
+			{
+				auto name = baseName(entry.name);
+				auto parts = name.split("_");
+				if (parts.length < 4 || parts[3].length < 8)
+					continue;
+				if (parts[3][0 .. 8] != prefix)
+					continue;
+				auto candidate = buildPath(entry.name, "messages.jsonl");
+				if (candidate.exists)
+				{
+					transcriptPath_ = candidate;
+					transcriptDir_ = dirName(candidate);
+					return transcriptPath_;
+				}
+			}
+		}
+		catch (Exception) {}
+
+		// Create a new legacy-layout dir, mirroring createHistoryForkDestination.
+		import std.datetime : Clock;
+		import std.format : format;
+		auto now = Clock.currTime;
+		auto id8 = sessionId_[0 .. 8];
+		auto newDir = buildPath(sessionsDir,
+			format!"session_%04d%02d%02d_%02d%02d%02d_%s"(now.year,
+				cast(int) now.month, now.day, now.hour, now.minute, now.second,
+				id8));
+		try
+		{
+			mkdirRecurse(newDir);
+			auto timestamp = format!"%04d-%02d-%02dT%02d:%02d:%02d.000000+00:00"(
+				now.year, cast(int) now.month, now.day, now.hour, now.minute,
+				now.second);
+			auto originDirectory = workDir.length > 0 ? workDir : ".";
+			auto meta = "{\n"
+				~ "  \"session_id\": " ~ toJson(sessionId_) ~ ",\n"
+				~ "  \"parent_session_id\": null,\n"
+				~ "  \"start_time\": " ~ toJson(timestamp) ~ ",\n"
+				~ "  \"end_time\": " ~ toJson(timestamp) ~ ",\n"
+				~ "  \"git_commit\": null,\n"
+				~ "  \"git_branch\": null,\n"
+				~ "  \"environment\": {\"working_directory\": "
+					~ toJson(originDirectory) ~ "},\n"
+				~ "  \"origin_directory\": " ~ toJson(originDirectory) ~ ",\n"
+				~ "  \"username\": \"cydo\",\n"
+				~ "  \"child_sessions\": [],\n"
+				~ "  \"loops\": [],\n"
+				~ "  \"title\": null,\n"
+				~ "  \"title_source\": \"auto\",\n"
+				~ "  \"total_messages\": 0\n"
+				~ "}";
+			write(buildPath(newDir, "meta.json"), meta);
+			write(buildPath(newDir, "messages.jsonl"), "");
+			transcriptPath_ = buildPath(newDir, "messages.jsonl");
+			transcriptDir_ = newDir;
+		}
+		catch (Exception) {}
+		return transcriptPath_;
+	}
+
+	private void appendTranscriptLine(string line)
+	{
+		if (transcriptPath_.length == 0)
+			return;
+		try
+		{
+			import std.file : append;
+			append(transcriptPath_, line ~ "\n");
+		}
+		catch (Exception) {}
+	}
+
+	/// The shared uuid of one assistant LLM message: text chunks carry
+	/// `assistant-<uuid>` and thinking chunks `reasoning-<uuid>-<n>`.
+	private static string assistantBaseUuid(string messageId)
+	{
+		import std.string : startsWith, lastIndexOf;
+		if (messageId.startsWith("assistant-"))
+			return messageId["assistant-".length .. $];
+		if (messageId.startsWith("reasoning-"))
+		{
+			auto rest = messageId["reasoning-".length .. $];
+			auto dash = rest.lastIndexOf('-');
+			if (dash > 0)
+				return rest[0 .. dash];
+			return rest;
+		}
+		return messageId;
+	}
+
+	/// Write the user line for a completed echo. Images are persisted as
+	/// session-dir attachment files and referenced by path, matching the
+	/// shape the persisted translator inlines (readHistoryImageAttachment).
+	private void writeUserTranscriptLine(PendingMessage submission, string text,
+		string messageId)
+	{
+		if (ensureTranscriptPath().length == 0)
+			return;
+		import std.base64 : Base64;
+		import std.file : mkdirRecurse, write;
+		import std.path : buildPath;
+		import std.format : format;
+
+		string imagesJson;
+		int imageIndex;
+		foreach (ref block; submission.content)
+		{
+			if (block.type != "image" || block.data.length == 0)
+				continue;
+			auto ext = block.media_type == "image/jpeg" ? "jpg"
+				: block.media_type == "image/gif" ? "gif"
+				: block.media_type == "image/webp" ? "webp" : "png";
+			auto fileName = format!"%s-%d.%s"(messageId, imageIndex++, ext);
+			auto relPath = buildPath("images", fileName);
+			auto absPath = buildPath(transcriptDir_, relPath);
+			try
+			{
+				mkdirRecurse(buildPath(transcriptDir_, "images"));
+				write(absPath, cast(ubyte[]) Base64.decode(block.data));
+			}
+			catch (Exception)
+				continue;
+			imagesJson ~= (imagesJson.length > 0 ? "," : "")
+				~ `{"source": {"kind": "file", "path": ` ~ toJson(absPath)
+				~ `}, "mime_type": ` ~ toJson(
+					block.media_type.length > 0 ? block.media_type : "image/png")
+				~ `}`;
+		}
+		auto line = `{"role": "user", "content": ` ~ toJson(text)
+			~ `, "injected": false, "message_id": ` ~ toJson(messageId);
+		if (imagesJson.length > 0)
+			line ~= `, "images": [` ~ imagesJson ~ `]`;
+		line ~= `}`;
+		appendTranscriptLine(line);
+	}
+
+	/// Write the accumulated assistant line (thinking + text + tool_calls)
+	/// and reset the accumulator. No-op when nothing accumulated.
+	private void flushAssistantLine()
+	{
+		if (!assistantAccumActive_)
+			return;
+		assistantAccumActive_ = false;
+		if (ensureTranscriptPath().length == 0)
+			return;
+		auto accum = assistantAccum_;
+		assistantAccum_ = AssistantAccum.init;
+		if (accum.text.length == 0 && accum.thinking.length == 0
+			&& accum.toolCalls.length == 0)
+			return;
+		auto messageId = accum.messageId.length > 0
+			? accum.messageId : accum.baseUuid;
+		auto line = `{"role": "assistant"`;
+		if (accum.thinking.length > 0)
+			line ~= `, "reasoning_content": ` ~ toJson(accum.thinking);
+		if (accum.text.length > 0)
+			line ~= `, "content": ` ~ toJson(accum.text);
+		line ~= `, "injected": false, "message_id": ` ~ toJson(messageId);
+		if (accum.toolCalls.length > 0)
+		{
+			import std.array : join;
+			line ~= `, "tool_calls": [` ~ accum.toolCalls.join(",") ~ `]`;
+		}
+		line ~= `}`;
+		appendTranscriptLine(line);
+	}
+
+	/// Write the tool-result line for a completed tool call.
+	private void writeToolTranscriptLine(ToolItem tool, VibeSessionUpdate update)
+	{
+		if (ensureTranscriptPath().length == 0)
+			return;
+		auto resultText = extractToolResultText(update.content, update.rawOutput);
+		auto line = `{"role": "tool", "content": ` ~ toJson(resultText)
+			~ `, "injected": false, "name": ` ~ toJson(tool.vibeName)
+			~ `, "tool_call_id": ` ~ toJson(tool.toolCallId);
+		auto structuredJson = vibeStructuredPayload(update.rawOutput);
+		if (structuredJson.length > 0)
+			line ~= `, "tool_result": ` ~ structuredJson;
+		line ~= `}`;
+		appendTranscriptLine(line);
 	}
 
 	private void rejectSubmission(PendingMessage submission, Exception error)
@@ -2195,6 +2771,8 @@ class VibeSession : AgentSession, VibeSessionHandler
 		activeTextItem = ActiveTextItem.init;
 		activeTools = null;
 		lastResultText = null;
+		assistantAccum_ = AssistantAccum.init;
+		assistantAccumActive_ = false;
 	}
 
 	private void drainPendingMessages()
@@ -2216,6 +2794,8 @@ class VibeSession : AgentSession, VibeSessionHandler
 		activeTextItem = ActiveTextItem.init;
 		activeTools = null;
 		lastResultText = null;
+		assistantAccum_ = AssistantAccum.init;
+		assistantAccumActive_ = false;
 		activeTurnNamespace_ = to!string(++turnNamespaceCounter_);
 		expectedUserMessages ~= new ExpectedUserMessage(submission);
 
@@ -2281,6 +2861,8 @@ class VibeSession : AgentSession, VibeSessionHandler
 		}
 		finalizeActiveTextItem();
 		finalizeAllTools();
+		// Transcript writer: the turn's last assistant message completes here.
+		flushAssistantLine();
 		emitTurnStop();
 		turnInProgress = false;
 		releaseGatedUserEcho(submission);
@@ -2620,6 +3202,9 @@ class VibeSession : AgentSession, VibeSessionHandler
 		userEv.correlation_id = submission.correlationId;
 		auto translated = TranslatedEvent(toJson(userEv), currentRawJson_);
 		translated.isContextBootstrap = submission.isContextBootstrap;
+		// Persist the user line once the echo completes (buildUserEcho runs
+		// exactly once per submitted message, outside replay mode).
+		writeUserTranscriptLine(submission, text, messageId);
 		return translated;
 	}
 
@@ -2629,6 +3214,31 @@ class VibeSession : AgentSession, VibeSessionHandler
 		if (replayMode)
 			return;
 		auto text = chunkText(update.content);
+		// Transcript writer: group thinking + text + tool_calls of one
+		// assistant LLM message into a single legacy assistant line. A new
+		// base uuid starts a new message, flushing the previous one.
+		auto baseUuid = assistantBaseUuid(update.messageId);
+		if (assistantAccumActive_
+			&& baseUuid != assistantAccum_.baseUuid)
+			flushAssistantLine();
+		if (!assistantAccumActive_)
+		{
+			assistantAccum_ = AssistantAccum.init;
+			assistantAccum_.baseUuid = baseUuid;
+			assistantAccumActive_ = true;
+		}
+		if (itemType == "text")
+		{
+			assistantAccum_.text ~= text;
+			// The assistant-<uuid> chunk is the canonical message id.
+			assistantAccum_.messageId = update.messageId;
+		}
+		else
+		{
+			assistantAccum_.thinking ~= text;
+			if (assistantAccum_.messageId.length == 0)
+				assistantAccum_.messageId = update.messageId;
+		}
 		if (activeTextItem.type != itemType
 			|| activeTextItem.sourceKey != update.messageId)
 		{
@@ -2676,31 +3286,38 @@ class VibeSession : AgentSession, VibeSessionHandler
 		finalizeActiveTextItem();
 
 		auto meta = parseVibeMeta(update.meta);
-		auto toolName = meta.toolName.length > 0 ? meta.toolName : "unknown";
-		string name = toolName;
-		string toolServer;
-		string toolSource;
-		if (toolName.startsWith("cydo_"))
-		{
-			toolServer = "cydo";
-			toolSource = "mcp";
-			name = toolName[5 .. $];
-		}
+		auto rawToolName = meta.toolName.length > 0 ? meta.toolName : "unknown";
+		auto parts = decomposeVibeToolName(rawToolName);
+		string name = parts.displayName;
 		auto inputJson = update.rawInput.json !is null && update.rawInput.json.length > 0
 			? update.rawInput.json : "{}";
 
 		auto id = "vb-tool-" ~ update.toolCallId;
-		ToolItem tool = ToolItem(id, name, inputJson, inputJson != "{}");
+		ToolItem tool = ToolItem(id, name, inputJson, inputJson != "{}",
+			parts.vibeName, update.toolCallId);
 		activeTools[update.toolCallId] = tool;
+
+		// Transcript writer: the tool call belongs to the assistant message
+		// currently accumulating (the model produced it after its text).
+		if (!assistantAccumActive_)
+		{
+			assistantAccum_ = AssistantAccum.init;
+			assistantAccum_.baseUuid = update.toolCallId;
+			assistantAccumActive_ = true;
+		}
+		assistantAccum_.toolCalls ~= `{"id": ` ~ toJson(update.toolCallId)
+			~ `, "index": ` ~ to!string(assistantAccum_.toolCalls.length)
+			~ `, "type": "function", "function": {"name": ` ~ toJson(parts.vibeName)
+			~ `, "arguments": ` ~ toJson(inputJson) ~ `}}`;
 
 		ItemStartedEvent toolStartEv;
 		toolStartEv.item_id   = id;
 		toolStartEv.item_type = "tool_use";
 		toolStartEv.name      = name;
-		if (toolServer.length > 0)
+		if (parts.toolServer.length > 0)
 		{
-			toolStartEv.tool_server = toolServer;
-			toolStartEv.tool_source = toolSource;
+			toolStartEv.tool_server = parts.toolServer;
+			toolStartEv.tool_source = parts.toolSource;
 		}
 		toolStartEv.input = JSONFragment(inputJson);
 		emitEvent(toJson(toolStartEv), currentRawJson_);
@@ -2748,6 +3365,13 @@ class VibeSession : AgentSession, VibeSessionHandler
 			emitEvent(toJson(inputDeltaEv), currentRawJson_);
 		}
 
+		// Transcript writer: the assistant message that produced this tool
+		// call is complete once its results start arriving (the model emits
+		// all of a message's tool calls before any execution), so flush its
+		// line before the tool-result line to keep the legacy order
+		// (assistant line with tool_calls, then tool result lines).
+		flushAssistantLine();
+
 		if (update.status == "completed" || update.status == "failed")
 		{
 			finalizeTool(*p, update, update.status == "failed");
@@ -2759,6 +3383,9 @@ class VibeSession : AgentSession, VibeSessionHandler
 		bool failed)
 	{
 		auto resultText = extractToolResultText(update.content, update.rawOutput);
+
+		// Transcript writer: persist the tool-result line.
+		writeToolTranscriptLine(tool, update);
 
 		ItemCompletedEvent toolCompEv;
 		toolCompEv.item_id = tool.id;
@@ -2856,6 +3483,44 @@ private struct VibeToolMeta
 	string checkpointKind;
 }
 
+/// Decomposed vibe tool name: the UI display name, the vibe-side name
+/// persisted in the transcript, and the CyDo MCP server attribution.
+private struct VibeToolNameParts
+{
+	string displayName;  // UI name ("SwitchMode")
+	string vibeName;     // transcript name ("cydo_SwitchMode")
+	string toolServer;   // "cydo" for CyDo MCP tools, else ""
+	string toolSource;   // "mcp" for CyDo MCP tools, else ""
+}
+
+/// Decompose a vibe tool name. vibe 2.x named CyDo's MCP tools
+/// `cydo_<Tool>`; vibe 3.x's Unified Harness surfaces them as
+/// `mcp_cydo.<Tool>` (programmatic group `mcp_cydo`, tool `<Tool>` —
+/// verified against vibe-acp 3.0.1). Both map to display name `<Tool>`
+/// with the cydo MCP server, and the transcript keeps the 2.x
+/// `cydo_<Tool>` name so the history translation and the
+/// interrupted-call repair are unchanged.
+private static VibeToolNameParts decomposeVibeToolName(string toolName)
+{
+	VibeToolNameParts parts;
+	parts.displayName = toolName;
+	parts.vibeName = toolName;
+	if (toolName.startsWith("mcp_cydo."))
+	{
+		parts.displayName = toolName["mcp_cydo.".length .. $];
+		parts.vibeName = "cydo_" ~ parts.displayName;
+		parts.toolServer = "cydo";
+		parts.toolSource = "mcp";
+	}
+	else if (toolName.startsWith("cydo_"))
+	{
+		parts.displayName = toolName["cydo_".length .. $];
+		parts.toolServer = "cydo";
+		parts.toolSource = "mcp";
+	}
+	return parts;
+}
+
 /// Parse the vibe-specific `_meta` object of a tool_call update
 /// (`tool_name`, `checkpoint_kind`).
 private VibeToolMeta parseVibeMeta(JSONFragment meta)
@@ -2895,10 +3560,14 @@ private string chunkText(JSONFragment content)
 }
 
 /// Unwrap a CyDo MCP tool's structured payload from vibe's raw result:
-/// vibe nests it under a `structured` field ({tasks:[...]} for Task,
-/// {status, qid, ...} for Ask/Answer). Empty when there is none — callers
-/// leave item/result.tool_result unset so plain tools (bash etc.) keep
-/// their text-only rendering.
+/// vibe 2.x nests it under a `structured` field ({tasks:[...]} for Task,
+/// {status, qid, ...} for Ask/Answer). vibe 3.x's Unified Harness drops
+/// the MCP structuredContent from rawOutput; for CyDo's structured results
+/// the payload rides as the result text itself (the MCP server sets
+/// content[0].text to the JSON string — see McpResult.structured), so a
+/// JSON-object result text is parsed back out. Empty when there is none —
+/// callers leave item/result.tool_result unset so plain tools (bash etc.)
+/// keep their text-only rendering.
 private string vibeStructuredPayload(JSONFragment rawOutput)
 {
 	if (rawOutput.json.length == 0)
@@ -2915,13 +3584,54 @@ private string vibeStructuredPayload(JSONFragment rawOutput)
 			return probe.structured.json;
 	}
 	catch (Exception) {}
+	// vibe 3.x shape: {type: "success", content: [{type: "text", text: ...}]}
+	@JSONPartial static struct V3Probe
+	{
+		@JSONOptional string type;
+		@JSONPartial static struct V3Content { string type; string text; }
+		@JSONOptional V3Content[] content;
+	}
+	try
+	{
+		auto probe = jsonParse!V3Probe(rawOutput.json);
+		if (probe.type == "success" && probe.content.length > 0)
+			foreach (ref entry; probe.content)
+			{
+				if (entry.type != "text" || entry.text.length == 0
+					|| entry.text[0] != '{')
+					continue;
+				import std.json : JSONType, parseJSON;
+				try
+				{
+					if (parseJSON(entry.text).type == JSONType.object)
+						return entry.text;
+				}
+				catch (Exception) {}
+			}
+	}
+	catch (Exception) {}
 	return "";
+}
+
+/// Extract plain text from a completed tool call, translating vibe 3.x's
+/// turn-cancellation output to the 2.x marker the interrupted-call repair
+/// rewrites (see extractToolResultTextRaw).
+private string extractToolResultText(JSONFragment content, JSONFragment rawOutput)
+{
+	auto result = extractToolResultTextRaw(content, rawOutput);
+	// vibe 3.x reports a turn-cancelled tool call as the plain output
+	// "client interrupt"; vibe 2.x persisted the same interruption as a
+	// `<user_cancellation>` marker. Keep the 2.x marker so the repair
+	// (which rewrites that marker to the real result) works unchanged.
+	if (result == "client interrupt")
+		return "<user_cancellation>Tool execution interrupted by user.</user_cancellation>";
+	return result;
 }
 
 /// Extract plain text from a completed tool call: the `content` array's
 /// text blocks, falling back to `rawOutput` (plain string, then
 /// content/detailedContent/stdout fields).
-private string extractToolResultText(JSONFragment content, JSONFragment rawOutput)
+private string extractToolResultTextRaw(JSONFragment content, JSONFragment rawOutput)
 {
 	// Vibe wraps CyDo MCP tool outcomes as {ok, server, tool, text,
 	// structured} — the content array only carries a "Ran <Tool>"
@@ -2948,6 +3658,35 @@ private string extractToolResultText(JSONFragment content, JSONFragment rawOutpu
 						return outcome;
 				}
 				catch (Exception) {}
+			}
+		}
+		catch (Exception) {}
+		// vibe 3.x's Unified Harness surfaces a tool outcome as
+		// {type: "success", content: [{type: "text", text: ...}], _meta} —
+		// the tool result's content blocks ride in rawOutput.content. The
+		// ACP content array additionally carries the tool name as a second
+		// text block, so rawOutput is the cleaner source.
+		@JSONPartial static struct V3OutcomeProbe
+		{
+			@JSONOptional string type;
+			@JSONPartial static struct V3Content { string type; string text; }
+			@JSONOptional V3Content[] content;
+		}
+		try
+		{
+			auto probe = jsonParse!V3OutcomeProbe(rawOutput.json);
+			if (probe.type == "success" && probe.content.length > 0)
+			{
+				string result;
+				foreach (ref entry; probe.content)
+					if (entry.type == "text" && entry.text.length > 0)
+					{
+						if (result.length > 0)
+							result ~= "\n";
+						result ~= entry.text;
+					}
+				if (result.length > 0)
+					return result;
 			}
 		}
 		catch (Exception) {}
@@ -3198,9 +3937,11 @@ unittest
 {
 	auto agent = new VibeAgent;
 
-	// With no overrides, hardcoded defaults apply.
+	// With no overrides, hardcoded defaults apply. Every class maps to
+	// `mistral-medium-3.5`, vibe 2.26.x's only built-in hosted model (the
+	// removed `devstral-small` alias is rejected by vibe-acp).
 	assert(agent.resolveModelSpec("small")
-		== ModelSpec(ModelSpecFields("devstral-small")));
+		== ModelSpec(ModelSpecFields("mistral-medium-3.5")));
 	assert(agent.resolveModelSpec("medium")
 		== ModelSpec(ModelSpecFields("mistral-medium-3.5")));
 	assert(agent.resolveModelSpec("large")
@@ -3237,31 +3978,21 @@ unittest
 
 unittest
 {
-	import std.algorithm : canFind;
-
 	auto agent = new VibeAgent;
 	assert(agent.executableName(["CYDO_VIBE_BIN": "/opt/vibe-acp"])
 		== "/opt/vibe-acp");
-	assert(agent.oneShotExecutableName(["CYDO_VIBE_CLI_BIN": "/opt/vibe"])
-		== "/opt/vibe");
+	assert(agent.executableName(null) == "vibe-acp");
 
+	// The one-shot spawns vibe-acp itself (vibe 3.x removed the legacy
+	// runtime, and the one-shot `vibe` CLI's app-server spawn path shells
+	// out to `uv`, absent in the sandbox) — no CLI flags, no --yolo, no
+	// removed harness-selection flags.
 	ProcessLaunch launch; // .init: no cmdPrefix
-	auto args = buildVibeOneShotArgs("vibe", "hello", launch);
-	assert(args == [
-		"vibe", "--prompt", "hello", "--output", "text",
-		"--max-turns", "1", "--enabled-tools", "__cydo_no_tools__",
-	]);
-	// The no-tools completion never auto-approves tool calls.
-	assert(!args.canFind("--yolo"));
-	// vibe has no --model flag; the model travels via the VIBE_ACTIVE_MODEL
-	// env override set in completeOneShot.
-	assert(!args.canFind("--model"));
+	auto args = buildVibeOneShotArgs("vibe-acp", launch);
+	assert(args == ["vibe-acp"]);
 	launch.cmdPrefix = ["bwrap"];
-	auto prefixed = buildVibeOneShotArgs("vibe", "hello", launch);
-	assert(prefixed == [
-		"bwrap", "vibe", "--prompt", "hello", "--output", "text",
-		"--max-turns", "1", "--enabled-tools", "__cydo_no_tools__",
-	]);
+	auto prefixed = buildVibeOneShotArgs("vibe-acp", launch);
+	assert(prefixed == ["bwrap", "vibe-acp"]);
 }
 
 unittest
@@ -3752,6 +4483,154 @@ unittest
 
 unittest
 {
+	// Transcript writer (vibe 3.x stores sessions in the unified chunked
+	// store, which has no messages.jsonl): the driver keeps its own
+	// legacy-shaped transcript per session, written from the live ACP
+	// stream, so the history pipeline (live watch, fork, undo) works
+	// unchanged. A full turn — user echo, thinking + text, a tool call
+	// with its result, and a final text — lands as user/assistant/tool
+	// lines that the persisted translator reads back.
+	import std.algorithm : canFind;
+	import std.file : exists, mkdirRecurse, readText, rmdirRecurse, tempDir;
+	import std.path : buildPath;
+	import std.string : lineSplitter;
+	import cydo.runtime.config : AgentDriver;
+
+	auto profileRoot = buildPath(tempDir(), "cydo-vibe-transcript");
+	if (exists(profileRoot))
+		rmdirRecurse(profileRoot);
+	mkdirRecurse(profileRoot);
+	scope (exit)
+		if (exists(profileRoot))
+			rmdirRecurse(profileRoot);
+	auto profile = NativeHistoryProfile(AgentDriver.vibe, profileRoot);
+
+	auto connection = new TestVibeConnection;
+	auto server = makeTestVibeAcpProcess(connection);
+	auto session = attachSession(server, 1, null, "", "/test/workdir",
+		SessionConfig.init, profile);
+	string[] emitted;
+	session.onOutput = (TranslatedEvent event) {
+		emitted ~= event.translated;
+	};
+
+	auto submission = new TestVibeSubmissionOutcome(
+		session.sendMessage([ContentBlock("text", "list files")], "nonce-1"));
+	auto newRequest = connection.takeRequest("session/new");
+	connection.respond(newRequest,
+		acceptedVibeResponse(`{"sessionId":"native-vibe-1"}`));
+	drainVibePromiseNextTicks();
+	assertVibeAcceptedOnce(submission);
+	auto promptRequest = connection.takeRequest("session/prompt");
+
+	// User echo completes the user line.
+	connection.receive(vibeUpdate("native-vibe-1",
+		`{"sessionUpdate":"user_message_chunk","messageId":"um1","content":{"type":"text","text":"list files"}}`));
+	drainVibePromiseNextTicks();
+	// Thinking + text of the first assistant message, then its tool call.
+	connection.receive(vibeUpdate("native-vibe-1",
+		`{"sessionUpdate":"agent_thought_chunk","messageId":"reasoning-uuid1-0","content":{"type":"text","text":"let me think"}}`));
+	connection.receive(vibeUpdate("native-vibe-1",
+		`{"sessionUpdate":"agent_message_chunk","messageId":"assistant-uuid1","content":{"type":"text","text":"I will run ls"}}`));
+	connection.receive(vibeUpdate("native-vibe-1",
+		`{"sessionUpdate":"tool_call","toolCallId":"call_1","rawInput":{"command":"ls"},"_meta":{"tool_name":"bash"}}`));
+	// The tool result lands as a tool line.
+	connection.receive(vibeUpdate("native-vibe-1",
+		`{"sessionUpdate":"tool_call_update","toolCallId":"call_1","status":"completed","content":[{"content":{"text":"file.txt"}}],"rawOutput":{"stdout":"file.txt"}}`));
+	// A second assistant message (new base uuid) flushes the first line.
+	connection.receive(vibeUpdate("native-vibe-1",
+		`{"sessionUpdate":"agent_message_chunk","messageId":"assistant-uuid2","content":{"type":"text","text":"Done."}}`));
+	// Turn end flushes the second assistant line.
+	connection.respond(promptRequest, acceptedVibeResponse(
+		`{"stopReason":"end_turn","usage":{"input_tokens":11,"output_tokens":7}}`));
+	drainVibePromiseNextTicks();
+
+	// The transcript resolves through the agent's historyPath scan.
+	auto agent = new VibeAgent;
+	auto path = agent.historyPath("native-vibe-1", profile);
+	assert(path !is null, "transcript file must resolve via historyPath");
+	assert(path.canFind("session_") && path.canFind("native-v"));
+
+	string[] lines;
+	foreach (line; readText(path).lineSplitter)
+		if (line.length > 0)
+			lines ~= line;
+	assert(lines.length == 4, "expected user + 2 assistant + tool lines, got "
+		~ to!string(lines.length));
+
+	// Line 1: the user line, keyed by the vibe user message id.
+	@JSONPartial static struct RoleProbe { string role; string content; string message_id; }
+	auto userLine = jsonParse!RoleProbe(lines[0]);
+	assert(userLine.role == "user");
+	assert(userLine.content == "list files");
+	assert(userLine.message_id == "um1");
+
+	// Line 2: the first assistant message groups thinking + text + the
+	// tool call into one line (the persisted translator synthesizes
+	// turn/result only for a plain-content line).
+	@JSONPartial static struct AssistantProbe
+	{
+		string role;
+		@JSONOptional string content;
+		@JSONOptional string reasoning_content;
+		@JSONOptional JSONFragment tool_calls;
+		string message_id;
+	}
+	auto firstAssistant = jsonParse!AssistantProbe(lines[1]);
+	assert(firstAssistant.role == "assistant");
+	assert(firstAssistant.content == "I will run ls");
+	assert(firstAssistant.reasoning_content == "let me think");
+	assert(firstAssistant.message_id == "assistant-uuid1");
+	auto calls = jsonParse!(VibeHistoryToolCall[])(firstAssistant.tool_calls.json);
+	assert(calls.length == 1);
+	assert(calls[0].id == "call_1");
+	assert(calls[0].function_.name == "bash");
+	assert(calls[0].function_.arguments == `{"command":"ls"}`);
+
+	// Line 3: the tool result line pairs with the tool call id.
+	@JSONPartial static struct ToolProbe
+	{
+		string role;
+		string content;
+		string name;
+		string tool_call_id;
+	}
+	auto toolLine = jsonParse!ToolProbe(lines[2]);
+	assert(toolLine.role == "tool");
+	assert(toolLine.tool_call_id == "call_1");
+	assert(toolLine.name == "bash");
+	assert(toolLine.content.canFind("file.txt"));
+
+	// Line 4: the final assistant message (plain content closes the turn).
+	auto lastAssistant = jsonParse!AssistantProbe(lines[3]);
+	assert(lastAssistant.role == "assistant");
+	assert(lastAssistant.content == "Done.");
+	assert(lastAssistant.message_id == "assistant-uuid2");
+
+	// The written lines round-trip through the persisted translator.
+	auto translated = agent.translateHistoryLine(lines[0], 1, path);
+	assert(translated.length == 1);
+	auto userItem = jsonParse!ItemStartedEvent(translated[0].translated);
+	assert(userItem.item_type == "user_message" && userItem.uuid == "um1");
+	auto assistantTranslated = agent.translateHistoryLine(lines[3], 4, path);
+	assert(assistantTranslated.length == 4);
+	assert(jsonParse!TurnResultEvent(assistantTranslated[3].translated).result
+		== "Done.");
+}
+
+unittest
+{
+	// assistantBaseUuid groups the reasoning-/assistant- chunk messageIds
+	// of one LLM message.
+	assert(VibeSession.assistantBaseUuid("assistant-422227e6-5ee1-539c-8689-679e658b595f")
+		== "422227e6-5ee1-539c-8689-679e658b595f");
+	assert(VibeSession.assistantBaseUuid("reasoning-422227e6-5ee1-539c-8689-679e658b595f-0")
+		== "422227e6-5ee1-539c-8689-679e658b595f");
+	assert(VibeSession.assistantBaseUuid("plain-id") == "plain-id");
+}
+
+unittest
+{
 	// A line-handler fault contained by AgentProcess reaches the session
 	// as a task diagnostic and keeps the session alive (mirrors the
 	// Claude driver's reportLineHandlerError wiring).
@@ -4052,36 +4931,160 @@ unittest
 
 unittest
 {
-	// One-shot completion runs without tools: --yolo is never passed and
-	// the no-tools sentinel rides --enabled-tools.
-	auto args = buildVibeOneShotArgs("vibe", "summarize this", ProcessLaunch.init);
-	assert(!args.canFind("--yolo"));
-	bool sentinelFollowsFlag = false;
-	foreach (i, arg; args)
-		if (arg == "--enabled-tools" && i + 1 < args.length)
-			sentinelFollowsFlag = args[i + 1] == "__cydo_no_tools__";
-	assert(sentinelFollowsFlag);
-	assert(args.canFind("--max-turns") && args.canFind("1"));
-}
-
-unittest
-{
 	// The unsandboxed one-shot env carries the provider reachability
-	// passthrough keys and the model override.
+	// passthrough keys and the title-generation suppression.
 	import std.process : environment;
 
 	environment["NO_PROXY"] = "vibe-one-shot-env-test";
 	scope (exit)
 		environment.remove("NO_PROXY");
-	auto env = buildVibeOneShotEnv("mock-model");
-	assert(env["VIBE_ACTIVE_MODEL"] == "mock-model");
+	auto env = buildVibeOneShotEnv();
 	assert(env["NO_PROXY"] == "vibe-one-shot-env-test");
+	assert(env["VIBE_SESSION_LOGGING__GENERATE_TITLES"] == "false");
 	assert("PATH" in env && "HOME" in env);
+}
 
-	// An empty model leaves the override unset so vibe's configured
-	// default applies.
-	auto noModel = buildVibeOneShotEnv("");
-	assert("VIBE_ACTIVE_MODEL" !in noModel);
+unittest
+{
+	// The one-shot no-tools override denies the mutating built-in tools via
+	// a per-child VIBE_TOOLS env override (vibe 3.x has no config-level way
+	// to disable the built-in harness tools).
+	import std.json : JSONType, parseJSON;
+
+	auto value = parseJSON(vibeOneShotNoToolsJson);
+	assert(value.type == JSONType.object);
+	foreach (tool; ["bash", "read_file", "write_file", "edit", "skill"])
+	{
+		auto entry = tool in value.object;
+		assert(entry !is null && entry.type == JSONType.object);
+		auto permission = "permission" in entry.object;
+		assert(permission !is null && permission.type == JSONType.string);
+		assert(permission.str == "never");
+	}
+}
+
+unittest
+{
+	// vibe 3.x tool names: the Unified Harness surfaces CyDo's MCP tools as
+	// `mcp_cydo.<Tool>`; both that and the 2.x `cydo_<Tool>` name decompose
+	// to the same display name, server attribution, and transcript name.
+	auto v3 = decomposeVibeToolName("mcp_cydo.SwitchMode");
+	assert(v3.displayName == "SwitchMode");
+	assert(v3.vibeName == "cydo_SwitchMode");
+	assert(v3.toolServer == "cydo" && v3.toolSource == "mcp");
+
+	auto v2 = decomposeVibeToolName("cydo_Task");
+	assert(v2.displayName == "Task");
+	assert(v2.vibeName == "cydo_Task");
+	assert(v2.toolServer == "cydo" && v2.toolSource == "mcp");
+
+	auto builtin = decomposeVibeToolName("bash");
+	assert(builtin.displayName == "bash");
+	assert(builtin.vibeName == "bash");
+	assert(builtin.toolServer.length == 0 && builtin.toolSource.length == 0);
+}
+
+unittest
+{
+	// vibe 3.x tool results: the MCP outcome rides in rawOutput as
+	// {type: "success", content: [{type: "text", text: ...}]} — the ACP
+	// content array's second block (the tool name) must not leak into the
+	// result text. A turn-cancelled call ("client interrupt") translates to
+	// the 2.x `<user_cancellation>` marker the repair rewrites.
+	auto raw = JSONFragment(
+		`{"type":"success","content":[{"type":"text","text":"Mode switch to 'plan' accepted."}],"_meta":{}}`);
+	auto content = JSONFragment(
+		`[{"type":"content","content":{"type":"text","text":"Mode switch to 'plan' accepted."}},` ~
+		`{"type":"content","content":{"type":"text","text":"mcp_cydo.SwitchMode"}}]`);
+	assert(extractToolResultText(content, raw)
+		== "Mode switch to 'plan' accepted.");
+
+	auto cancelledRaw = JSONFragment(`"client interrupt"`);
+	auto cancelledContent = JSONFragment(
+		`[{"type":"content","content":{"type":"text","text":"client interrupt"}}]`);
+	assert(extractToolResultText(cancelledContent, cancelledRaw)
+		== "<user_cancellation>Tool execution interrupted by user.</user_cancellation>");
+}
+
+unittest
+{
+	// vibe 3.x drops the MCP structuredContent from rawOutput; a JSON-object
+	// result text is the structured payload (McpResult.structured sets
+	// content[0].text to the JSON string). Plain text stays unstructured.
+	auto structured = JSONFragment(
+		`{"type":"success","content":[{"type":"text","text":"{\"tasks\":[{\"id\":7}]}"}],"_meta":{}}`);
+	assert(vibeStructuredPayload(structured) == `{"tasks":[{"id":7}]}`);
+
+	auto plain = JSONFragment(
+		`{"type":"success","content":[{"type":"text","text":"Mode switch accepted."}],"_meta":{}}`);
+	assert(vibeStructuredPayload(plain) == "");
+
+	// The 2.x {structured: ...} wrapper still wins when present.
+	auto legacy = JSONFragment(`{"ok":true,"server":"cydo","tool":"Task","text":"x","structured":{"tasks":[]}}`);
+	assert(vibeStructuredPayload(legacy) == `{"tasks":[]}`);
+}
+
+unittest
+{
+	// The ACP one-shot: initialize → session/new (no MCP servers) →
+	// session/set_mode "ask" (the no-tools guard) → session/set_config_option
+	// model → session/prompt; assistant text chunks accumulate into the
+	// result, and every permission request is denied.
+	auto connection = new TestVibeConnection;
+	auto promise = new Promise!string;
+	string result;
+	bool rejected;
+	promise.then((string text) { result = text; })
+		.except((Exception) { rejected = true; })
+		.ignoreResult();
+	auto oneShot = new VibeOneShotAcp(connection, "mock", "title this",
+		promise);
+
+	auto initReq = connection.takeRequest("initialize");
+	connection.respond(initReq, JsonRpcResponse.success(initReq.id,
+		jsonParse!SO(`{"protocolVersion":1}`)));
+	drainVibePromiseNextTicks();
+
+	auto newReq = connection.takeRequest("session/new");
+	auto newParams = newReq.params.deserializeTo!NewSessionParams();
+	assert(newParams.mcpServers is null || newParams.mcpServers.length == 0);
+	connection.respond(newReq, JsonRpcResponse.success(newReq.id,
+		jsonParse!SO(`{"sessionId":"oneshot-1"}`)));
+	drainVibePromiseNextTicks();
+
+	auto modeReq = connection.takeRequest("session/set_mode");
+	auto modeParams = modeReq.params.deserializeTo!SetModeParams();
+	assert(modeParams.sessionId == "oneshot-1" && modeParams.modeId == "ask");
+	connection.respond(modeReq, JsonRpcResponse.success(modeReq.id,
+		jsonParse!SO(`{}`)));
+	drainVibePromiseNextTicks();
+
+	auto modelReq = connection.takeRequest("session/set_config_option");
+	auto modelParams = modelReq.params.deserializeTo!SetConfigOptionParams();
+	assert(modelParams.configId == "model" && modelParams.value == "mock");
+	connection.respond(modelReq, JsonRpcResponse.success(modelReq.id,
+		jsonParse!SO(`{}`)));
+	drainVibePromiseNextTicks();
+
+	auto promptReq = connection.takeRequest("session/prompt");
+	// Assistant text arrives in chunks before the prompt response.
+	connection.receive(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"oneshot-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"A "},"messageId":"m1"}}}`);
+	connection.receive(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"oneshot-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Title"},"messageId":"m1"}}}`);
+	// A permission request mid-turn is denied (the no-tools guard).
+	connection.receive(`{"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"sessionId":"oneshot-1","toolCall":{"toolCallId":"t1"}}}`);
+	drainVibePromiseNextTicks();
+	auto permResp = jsonParse!JsonRpcResponse(connection.sentMessages[0]);
+	connection.sentMessages = connection.sentMessages[1 .. $];
+	assert(permResp.id && toJson(permResp.id) == "99");
+	assert(!permResp.isError);
+	auto outcome = permResp.result.deserializeTo!PermissionOutcome();
+	assert(outcome.outcome.outcome == "cancelled");
+
+	connection.respond(promptReq, JsonRpcResponse.success(promptReq.id,
+		jsonParse!SO(`{"stopReason":"end_turn"}`)));
+	drainVibePromiseNextTicks();
+	assert(!rejected);
+	assert(result == "A Title");
 }
 
 unittest
@@ -4611,6 +5614,54 @@ unittest
 
 unittest
 {
+	import std.file : exists, mkdirRecurse, rmdirRecurse, tempDir, write;
+	import std.path : buildPath;
+
+	auto root = buildPath(tempDir(), "cydo-vibe-discard-unified");
+	if (exists(root))
+		rmdirRecurse(root);
+	scope (exit)
+		if (exists(root))
+			rmdirRecurse(root);
+
+	auto agent = new VibeAgent;
+	auto profile = NativeHistoryProfile(AgentDriver.vibe,
+		buildPath(root, "home", ".vibe"));
+	auto sessionsDir = buildPath(profile.root, "logs", "session");
+	auto unifiedDir = buildPath(sessionsDir, "unified");
+	auto sessionId = "abcd1234abcd1234";
+	auto storeDir = buildPath(unifiedDir, sessionId);
+	auto otherStoreDir = buildPath(unifiedDir, "99999999eeeeeeee");
+
+	// No transcript: vibe's store is the only copy and must be kept.
+	mkdirRecurse(buildPath(storeDir, "generations"));
+	write(buildPath(storeDir, "CURRENT"), "{}");
+	agent.discardUnifiedStoreForResume(sessionId, profile);
+	assert(exists(buildPath(storeDir, "CURRENT")));
+
+	// Transcript present: the store is discarded so session/load imports
+	// the driver-written transcript instead.
+	mkdirRecurse(buildPath(sessionsDir, "session_20260101_010101_abcd1234"));
+	write(buildPath(sessionsDir, "session_20260101_010101_abcd1234",
+		"messages.jsonl"), "{}\n");
+	mkdirRecurse(buildPath(otherStoreDir, "generations"));
+	write(buildPath(otherStoreDir, "CURRENT"), "{}");
+	agent.discardUnifiedStoreForResume(sessionId, profile);
+	assert(!exists(storeDir));
+	// Other sessions' stores are untouched.
+	assert(exists(buildPath(otherStoreDir, "CURRENT")));
+
+	// Transcript present but no store: a no-op, not an error.
+	agent.discardUnifiedStoreForResume(sessionId, profile);
+
+	// Empty profile root: a no-op.
+	auto emptyProfile = NativeHistoryProfile.init;
+	agent.discardUnifiedStoreForResume(sessionId, emptyProfile);
+	agent.discardUnifiedStoreForResume(null, profile);
+}
+
+unittest
+{
 	// History translation (Part 4): persisted LLM-message lines map to the
 	// same agnostic shapes the live session emits.
 	auto agent = new VibeAgent;
@@ -5032,7 +6083,7 @@ unittest
 {
 	// createHistoryForkDestination: a fork gets its own session dir with a
 	// meta.json carrying the forked session_id — the shape vibe's session/load
-	// validates (required fields verified against 2.25.8).
+	// validates (required fields verified against 2.26.1).
 	import std.algorithm : canFind;
 	import std.file : exists, mkdirRecurse, readText, rmdirRecurse, tempDir, write;
 	import std.path : baseName, buildPath, dirName;

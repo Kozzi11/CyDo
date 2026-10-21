@@ -185,29 +185,31 @@ EOF
             meta.platforms = [ "x86_64-linux" "aarch64-linux" ];
           };
 
-          # Mistral Vibe — pre-built PyInstaller onedir bundles from GitHub
-          # releases. Two binaries ship from the same release: `vibe-acp`
-          # (the ACP server used for sessions) and `vibe` (the one-shot CLI);
-          # both read the same config.
-          vibeVersion = "2.25.8";
+          # Mistral Vibe — `vibe-acp` (the ACP server used for sessions and
+          # one-shot completions) is a pre-built PyInstaller onedir bundle
+          # from the GitHub release. v3 ships no standalone `vibe` CLI asset,
+          # and the PyPI wheel's Rust CLI cannot spawn its app-server inside
+          # the sandbox (it shells out to `uv`), so the driver runs one-shots
+          # through vibe-acp itself and only this bundle is packaged.
+          #
+          # v3 notes for the driver (source/cydo/agent/drivers/vibe.d): the
+          # legacy runtime and the --legacy-harness flag are gone (sessions
+          # always use the Unified Harness, which stores transcripts in the
+          # chunked logs/session/unified/<uuid>/ store — the driver keeps its
+          # own legacy-shaped messages.jsonl transcript per session), MCP
+          # tools are exposed to the model only via programmatic tool calling
+          # (`run_typescript` + `tools.mcp_cydo.<Tool>`), and the
+          # tools/list + stats/read + diagnostics/list app-server RPCs are
+          # removed (the driver uses neither).
+          vibeVersion = "3.0.1";
           vibeAcpSrc = {
             x86_64-linux = {
               url = "https://github.com/mistralai/mistral-vibe/releases/download/v${vibeVersion}/vibe-acp-linux-x86_64-${vibeVersion}.tar.gz";
-              hash = "sha256-2+aT7mbyn9/PkCncvzstTaE4VUsZPkMrCJhAFI7PCLM=";
+              hash = "sha256-B3FUTzL2QTJzHj1Ayh/fpijGB22uGtTSc/3DFWKhMGI=";
             };
             aarch64-linux = {
               url = "https://github.com/mistralai/mistral-vibe/releases/download/v${vibeVersion}/vibe-acp-linux-aarch64-${vibeVersion}.tar.gz";
-              hash = "sha256-CZEykUdv0vj8XCszBgLWr97TrmwBbhl9nc+AWSK/gug=";
-            };
-          }.${system} or (throw "Mistral Vibe: unsupported system ${system}");
-          vibeCliSrc = {
-            x86_64-linux = {
-              url = "https://github.com/mistralai/mistral-vibe/releases/download/v${vibeVersion}/vibe-linux-x86_64-${vibeVersion}.zip";
-              hash = "sha256-b8HqXSM4vKG7EQ09NugNq+kry3rc34d+JfqWl/TDrYQ=";
-            };
-            aarch64-linux = {
-              url = "https://github.com/mistralai/mistral-vibe/releases/download/v${vibeVersion}/vibe-linux-aarch64-${vibeVersion}.zip";
-              hash = "sha256-YYxeJvAeQK5TUz3EcOCYwPL5H56yeWpZDqKtVyS1eVE=";
+              hash = "sha256-fvghAbI9KG+0PrkRpvLXXPZ8uwyj0Cbn/x252MyvMuA=";
             };
           }.${system} or (throw "Mistral Vibe: unsupported system ${system}");
 
@@ -215,26 +217,22 @@ EOF
             pname = "mistral-vibe";
             version = vibeVersion;
             src = pkgs.fetchurl { inherit (vibeAcpSrc) url hash; };
-            cliZip = pkgs.fetchurl { inherit (vibeCliSrc) url hash; };
-            nativeBuildInputs = [ pkgs.autoPatchelfHook pkgs.unzip ];
+            nativeBuildInputs = [ pkgs.autoPatchelfHook ];
             buildInputs = [ pkgs.zlib pkgs.libgcc.lib pkgs.stdenv.cc.cc.lib ];
             # PyInstaller binaries are pre-stripped; patching may corrupt them.
             dontStrip = true;
             unpackPhase = ''
               runHook preUnpack
               tar xzf $src
-              unzip -q $cliZip -d cli
               runHook postUnpack
             '';
             installPhase = ''
-              # PyInstaller onedir: _internal/ must sit next to each binary;
+              # PyInstaller onedir: _internal/ must sit next to the binary;
               # the bootloader resolves it via the real executable path, so
-              # the bin/ entries can be symlinks.
-              mkdir -p $out/lib/mistral-vibe/acp $out/lib/mistral-vibe/cli $out/bin
+              # the bin/ entry can be a symlink.
+              mkdir -p $out/lib/mistral-vibe/acp $out/bin
               cp -r vibe-acp _internal $out/lib/mistral-vibe/acp/
-              cp -r cli/vibe cli/_internal $out/lib/mistral-vibe/cli/
               ln -s $out/lib/mistral-vibe/acp/vibe-acp $out/bin/vibe-acp
-              ln -s $out/lib/mistral-vibe/cli/vibe $out/bin/vibe
             '';
             meta.platforms = [ "x86_64-linux" "aarch64-linux" ];
           };
@@ -890,7 +888,6 @@ EOF
 
               ${lib.optionalString (agentType == "vibe") ''
               ln -sf ${mistral-vibe}/bin/vibe-acp /tmp/fake-bin/vibe-acp
-              ln -sf ${mistral-vibe}/bin/vibe /tmp/fake-bin/vibe
               ''}
 
               mkdir -p /tmp/playwright-home/.config/cydo
