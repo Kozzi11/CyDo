@@ -149,6 +149,13 @@ test("task prompt system message keeps task type label after reload", { tag: ["@
   await expect(
     page.locator(`.sidebar-item[data-tid="${childTid}"].active`),
   ).toBeVisible();
+  // Wait for the child's history to load: the assistant reply proves the
+  // message list is populated before we assert on the system message.
+  await expect(
+    page.locator('[style*="display: contents"] .message-list', {
+      hasText: "task-prompt-replay",
+    }),
+  ).toBeVisible({ timeout: responseTimeout(agentType) });
   await expect(
     page.locator('[style*="display: contents"] .message-list .system-user-message', {
       hasText: "Task prompt: research",
@@ -161,6 +168,12 @@ test("task prompt system message keeps task type label after reload", { tag: ["@
   await expect(
     page.locator(`.sidebar-item[data-tid="${childTid}"].active`),
   ).toBeVisible();
+  // Same history-load wait after reload.
+  await expect(
+    page.locator('[style*="display: contents"] .message-list', {
+      hasText: "task-prompt-replay",
+    }),
+  ).toBeVisible({ timeout: responseTimeout(agentType) });
   await expect(
     page.locator('[style*="display: contents"] .message-list .system-user-message', {
       hasText: "Task prompt: research",

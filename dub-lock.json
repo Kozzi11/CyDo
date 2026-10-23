@@ -1,8 +1,8 @@
 {
   "dependencies": {
     "ae": {
-      "version": "0.0.3887",
-      "sha256": "01b2kmpylh8j9smd9jri95msvfddwml31wgcx8x5nyhnkr5ah3gr"
+      "version": "0.0.3931",
+      "sha256": "099j7495kgvxcdkgqw3wzk5lzb8fgz7raq9y5akxxjh8kd6x631z"
     },
     "bolts": {
       "version": "1.7.0",
@@ -13,9 +13,9 @@
       "sha256": "0l461nflqc2kpv02y6abfnibcbw9jzbnp1pfkqlj6bifr8xbf1fi"
     },
     "djinja": {
-      "version": "defccf8856402a78851e3dcd4871e162fb76876f",
-      "repository": "https://github.com/VPanteleev-sym/djinja.git",
-      "sha256": "0a3xh22mfs89skv4n4faqwgf4n07ipkxpy5prhi430g8xpx5a090"
+      "version": "50c493f80601cebdea7ccced6ce8b341149a890a",
+      "repository": "https://github.com/Kozzi11/djinja.git",
+      "sha256": "02wrgjdn9sa50n37pnbqkq72ga6fd322ws3h8kiyichp86bxiwcr"
     },
     "dyaml": {
       "version": "0.10.0",

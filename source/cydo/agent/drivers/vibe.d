@@ -831,18 +831,16 @@ class VibeAgent : Agent
 	{
 		switch (modelClass)
 		{
-			// vibe 2.26.x ships exactly one built-in hosted model,
-			// `mistral-medium-3.5`; the old `devstral-small` default was a
-			// built-in that vibe removed (v2.26.1 drops it and warns on stale
-			// pins). vibe-acp rejects an unknown alias in
+			// vibe 3.x's model catalog exposes a tiered lineup; the aliases
+			// below are the catalog IDs that resolve on the Mistral hosted
+			// backend. vibe-acp rejects an unknown alias in
 			// session/set_config_option ("Unsupported config option
 			// model=..."), which fails session startup, and the one-shot CLI
-			// silently falls back to the default — so every class maps to the
-			// one alias that resolves. Users wanting a distinct small model
-			// configure `model_aliases` (or a custom [[models]] entry).
-			case "small":  return "mistral-medium-3.5";
+			// silently falls back to the default. Users wanting a different
+			// model configure `model_aliases` (or a custom [[models]] entry).
+			case "small":  return "mistral-small-2603";
 			case "medium": return "mistral-medium-3.5";
-			case "large":  return "mistral-medium-3.5";
+			case "large":  return "mistral-large-4";
 			default:       return modelClass; // pass through unknown aliases
 		}
 	}
@@ -3937,15 +3935,15 @@ unittest
 {
 	auto agent = new VibeAgent;
 
-	// With no overrides, hardcoded defaults apply. Every class maps to
-	// `mistral-medium-3.5`, vibe 2.26.x's only built-in hosted model (the
-	// removed `devstral-small` alias is rejected by vibe-acp).
+	// With no overrides, hardcoded defaults apply: vibe 3.x's catalog
+	// tiers small/medium/large to mistral-small-2603, mistral-medium-3.5,
+	// and mistral-large-4 respectively.
 	assert(agent.resolveModelSpec("small")
-		== ModelSpec(ModelSpecFields("mistral-medium-3.5")));
+		== ModelSpec(ModelSpecFields("mistral-small-2603")));
 	assert(agent.resolveModelSpec("medium")
 		== ModelSpec(ModelSpecFields("mistral-medium-3.5")));
 	assert(agent.resolveModelSpec("large")
-		== ModelSpec(ModelSpecFields("mistral-medium-3.5")));
+		== ModelSpec(ModelSpecFields("mistral-large-4")));
 
 	// An override replaces the default model.
 	agent.setModelAliases(["large": ModelSpec(ModelSpecFields("custom-model"))]);
@@ -3954,7 +3952,7 @@ unittest
 	// An effort-only override keeps the driver's default model.
 	agent.setModelAliases(["large": ModelSpec(ModelSpecFields("", "high"))]);
 	auto effortOnly = agent.resolveModelSpec("large");
-	assert(effortOnly.model == "mistral-medium-3.5");
+	assert(effortOnly.model == "mistral-large-4");
 	assert(effortOnly.effort == "high");
 
 	// An unknown class passes through, and can still be overridden.

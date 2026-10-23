@@ -1,10 +1,10 @@
 {
 	"fileVersion": 1,
 	"versions": {
-		"ae": "0.0.3887",
+		"ae": "0.0.3931",
 		"bolts": "1.7.0",
 		"configy": "2.2.0",
-		"djinja": {"version":"defccf8856402a78851e3dcd4871e162fb76876f","repository":"git+https://github.com/VPanteleev-sym/djinja.git"},
+		"djinja": {"version":"50c493f80601cebdea7ccced6ce8b341149a890a","repository":"git+https://github.com/Kozzi11/djinja.git"},
 		"dyaml": "0.10.0",
 		"openssl": "3.4.0",
 		"silly": "1.0.2",

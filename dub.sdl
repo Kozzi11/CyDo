@@ -12,7 +12,7 @@ dependency "ae:sqlite" version="~>0.0.3817"
 dependency "ae:openssl" version="~>0.0.3817"
 dependency "ae:zlib" version="~>0.0.3817"
 dependency "configy" version="~>2.2.0"
-dependency "djinja" repository="git+https://github.com/VPanteleev-sym/djinja.git" version="~master"
+dependency "djinja" repository="git+https://github.com/Kozzi11/djinja.git" version="~master"
 
 subPackage {
 	name "protocol-codegen"

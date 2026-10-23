@@ -338,6 +338,12 @@ test(
     );
     await page.reload();
     await offlineSetupHistoryEnd;
+    // The sidebar loads tasks asynchronously after reload; wait for the
+    // fork task (created earlier in this test) to appear before snapshotting
+    // tids, otherwise the snapshot races the sidebar and misses it.
+    await expect(
+      page.locator(`.sidebar-item[data-tid="${forkTid}"]`),
+    ).toBeVisible();
     const offlineParentHistory = await activePersistedMessages(page);
     const offlineTids = await snapshotTids(page);
     const taskCreatedBeforeUnsupported = taskCreatedEvents.length;
@@ -390,6 +396,10 @@ test(
     await expect(activeAssistantText(page, offlineTail)).toBeVisible({
       timeout: responseTimeout(agentType),
     });
+    // Same sidebar race as above: wait for the fork task to reappear.
+    await expect(
+      page.locator(`.sidebar-item[data-tid="${forkTid}"]`),
+    ).toBeVisible();
     expect(await snapshotTids(page)).toEqual(offlineTids);
     expect(await activePersistedMessages(page)).toEqual(offlineParentHistory);
     expect(codexRolloutRecords(Number(offlineParentTid))).toEqual(
